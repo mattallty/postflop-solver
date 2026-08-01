@@ -313,6 +313,39 @@ impl PostFlopGame {
         }
     }
 
+    /// Frees the memory used for the storage of the game.
+    ///
+    /// Call this once you are done querying a solved (or partially solved) game (e.g., after
+    /// saving it with [`save_data_to_file`] or extracting the results you need) if you want to
+    /// keep multiple [`PostFlopGame`] instances around (e.g., for comparison) without holding
+    /// onto all of their storage buffers, which are typically the dominant part of the game's
+    /// memory usage.
+    ///
+    /// The tree structure and configuration (e.g., [`card_config`], [`tree_config`],
+    /// [`memory_usage`]) are preserved, so calling [`allocate_memory`] again does not require
+    /// rebuilding the game from scratch. After calling this method, [`is_memory_allocated`]
+    /// returns `None`, [`is_solved`] returns `false`, and the game must be re-allocated (and
+    /// re-solved) before it can be queried or played again.
+    ///
+    /// Does nothing if the memory is not allocated yet.
+    ///
+    /// [`save_data_to_file`]: crate::save_data_to_file
+    /// [`card_config`]: #method.card_config
+    /// [`tree_config`]: #method.tree_config
+    /// [`memory_usage`]: #method.memory_usage
+    /// [`allocate_memory`]: #method.allocate_memory
+    /// [`is_memory_allocated`]: #method.is_memory_allocated
+    /// [`is_solved`]: Game::is_solved
+    #[inline]
+    pub fn free_memory(&mut self) {
+        if self.state <= State::TreeBuilt {
+            return;
+        }
+
+        self.clear_storage();
+        self.state = State::TreeBuilt;
+    }
+
     /// Allocates the memory.
     pub fn allocate_memory(&mut self, enable_compression: bool) {
         if self.state <= State::Uninitialized {

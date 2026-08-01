@@ -111,8 +111,8 @@ thread_local! {
 
 impl Encode for PostFlopGame {
     fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        if self.state <= State::Uninitialized {
-            return Err(EncodeError::Other("Game is not successfully initialized"));
+        if self.state < State::MemoryAllocated {
+            return Err(EncodeError::Other("Game's memory is not allocated"));
         }
 
         let num_storage = self.num_target_storage();
