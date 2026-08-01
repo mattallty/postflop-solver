@@ -1,5 +1,17 @@
 name: Rust
-on: [push, pull_request]
+
+# `on: [push, pull_request]` ran every PR commit twice: once for the branch push and once
+# for the pull request. Limiting `push` to the default branch keeps post-merge coverage of
+# `main` while leaving branch commits to the `pull_request` trigger alone.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs when new commits land on the same branch or PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
