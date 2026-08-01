@@ -1,25 +1,28 @@
 # postflop-solver
 
-> [!IMPORTANT]
-> **As of October 2023, I have started developing a poker solver as a business and have decided to suspend development of this open-source project. See [this issue] for more information.**
+An open-source postflop solver library written in Rust.
 
-[this issue]: https://github.com/b-inary/postflop-solver/issues/46
+> [!NOTE]
+> This is a **fork** of [b-inary/postflop-solver], whose author suspended development in
+> October 2023 ([upstream issue #46]) to work on a commercial solver.
+> This fork keeps the engine building and running on modern Rust toolchains and adds a few
+> library and example features. See [Fork changes](#fork-changes) below.
 
----
+[b-inary/postflop-solver]: https://github.com/b-inary/postflop-solver
+[upstream issue #46]: https://github.com/b-inary/postflop-solver/issues/46
 
-An open-source postflop solver library written in Rust
+Upstream documentation (does not cover the additions made in this fork):
+https://b-inary.github.io/postflop_solver/postflop_solver/
 
-Documentation: https://b-inary.github.io/postflop_solver/postflop_solver/
-
-**Related repositories**
+**Related repositories** (upstream, unmaintained)
 - Web app (WASM Postflop): https://github.com/b-inary/wasm-postflop
 - Desktop app (Desktop Postflop): https://github.com/b-inary/desktop-postflop
 
 **Note:**
-The primary purpose of this library is to serve as a backend engine for the GUI applications ([WASM Postflop] and [Desktop Postflop]).
-The direct use of this library by the users/developers is not a critical purpose by design.
-Therefore, breaking changes are often made without version changes.
-See [CHANGES.md](CHANGES.md) for details about breaking changes.
+The original purpose of this library was to serve as a backend engine for the GUI applications
+([WASM Postflop] and [Desktop Postflop]), so direct use by users/developers was not a design goal
+and breaking changes were often made without version changes.
+See [CHANGES.md](CHANGES.md) for the upstream list of breaking changes.
 
 [WASM Postflop]: https://github.com/b-inary/wasm-postflop
 [Desktop Postflop]: https://github.com/b-inary/desktop-postflop
@@ -30,14 +33,31 @@ See [CHANGES.md](CHANGES.md) for details about breaking changes.
 
 ```toml
 [dependencies]
-postflop-solver = { git = "https://github.com/b-inary/postflop-solver" }
+postflop-solver = { git = "https://github.com/mattallty/postflop-solver" }
 ```
+
+**Minimum supported Rust version: 1.97** (declared as `rust-version` in `Cargo.toml` and
+enforced by the `msrv` CI job). The crate uses `u64::isolate_lowest_one` and
+`AtomicU64::try_update`, which stabilized in 1.97.
+
+If `cargo build` fails with `use of unstable library feature` or `no method named
+isolate_lowest_one`, your toolchain is older than that — run `rustup update stable`.
+
+The optional `custom-alloc` feature additionally requires nightly. Everything else, including
+the full test suite, works on stable.
 
 - Examples
 
-You can find examples in the [examples](examples) directory.
+You can find examples in the [examples](examples) directory:
 
-If you have cloned this repository, you can run the example with the following command:
+| Example | Description |
+| --- | --- |
+| [`basic`](examples/basic.rs) | Build, solve, and query a game configured in Rust code. |
+| [`from_config`](examples/from_config.rs) | Same, but driven by an external JSON file. |
+| [`file_io`](examples/file_io.rs) | Save and load a solved game tree. |
+| [`node_locking`](examples/node_locking.rs) | Lock strategies at specific nodes. |
+
+If you have cloned this repository, you can run an example with the following command:
 
 ```sh
 $ cargo run --release --example basic
@@ -50,6 +70,32 @@ hard-coding it, using the `from_config` example:
 $ cargo run --release --example from_config -- examples/config.json
 ```
 
+See [examples/config.json](examples/config.json) for the expected schema (ranges, board,
+pot/stack, bet sizes, and solver stopping criteria).
+
+## Fork changes
+
+Relative to the last upstream commit:
+
+- **Builds on modern Rust.** `bincode` now resolves to the released 2.0, whose `Decode` /
+  `BorrowDecode` traits gained a `Context` generic parameter; the four hand-written bincode
+  impls were migrated. A handful of raw-pointer field accesses were made explicit for
+  rustc's `dangerous_implicit_autorefs` lint, and the remaining stable/nightly clippy and
+  rustdoc warnings were fixed so CI passes with `--deny warnings`.
+- **`PostFlopGame::visit`** — traverse the whole subtree below the current node, invoking a
+  closure at each node with the game positioned there (so `strategy`, `expected_values`,
+  `available_actions`, etc. are all available). The current node is restored afterwards.
+  Useful for statistics, custom exports, and strategy pruning. (upstream issue #15)
+- **`PostFlopGame::free_memory`** — release a solved game's storage buffers while keeping the
+  tree structure and configuration, so multiple game instances can be kept around without
+  holding all of their memory. `allocate_memory` can be called again without rebuilding.
+  (upstream issue #29)
+- **`from_config` example** — solve a game described by a JSON file instead of Rust code.
+  (upstream issue #53)
+
+The solver algorithm and its numerical behaviour are unchanged; the PioSOLVER-reference
+accuracy tests and the bunching tests still pass.
+
 ## Implementation details
 
 - **Algorithm**: The solver uses the state-of-the-art [Discounted CFR] algorithm.
@@ -57,7 +103,7 @@ $ cargo run --release --example from_config -- examples/config.json
   Also, the solver resets the cumulative strategy when the number of iterations is a power of 4.
 - **Performance**: The solver engine is highly optimized for performance with maintainable code.
   The engine supports multithreading by default, and it takes full advantage of unsafe Rust in hot spots.
-  The developer reviews the assembly output from the compiler and ensures that SIMD instructions are used as much as possible.
+  The original author reviewed the assembly output from the compiler and ensured that SIMD instructions are used as much as possible.
   Combined with the algorithm described above, the performance surpasses paid solvers such as PioSOLVER and GTO+.
 - **Isomorphism**: The solver does not perform any abstraction.
   However, isomorphic chances (turn and river deals) are combined into one.
@@ -74,7 +120,7 @@ $ cargo run --release --example from_config -- examples/config.json
 
 ## Crate features
 
-- `bincode`: Uses [bincode] crate (2.0.0-rc.3) to serialize and deserialize the `PostFlopGame` struct.
+- `bincode`: Uses [bincode] crate (2.0) to serialize and deserialize the `PostFlopGame` struct.
   This feature is required to save and load the game tree.
   Enabled by default.
 - `custom-alloc`: Uses custom memory allocator in solving process (only available in nightly Rust).
@@ -94,6 +140,9 @@ $ cargo run --release --example from_config -- examples/config.json
 ## License
 
 Copyright (C) 2022 Wataru Inariba
+
+Modifications in this fork are Copyright (C) 2026 Matthias Etienne, released under the same
+license.
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 

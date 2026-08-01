@@ -3,6 +3,9 @@ name = "postflop-solver"
 version = "0.1.0"
 authors = ["Wataru Inariba"]
 edition = "2021"
+# 1.97 is required by `u64::isolate_lowest_one` (src/bunching.rs) and
+# `AtomicU64::try_update` (src/atomic_float.rs). Verified by the `msrv` CI job.
+rust-version = "1.97"
 description = "An open-source postflop solver for Texas hold'em poker"
 documentation = "https://b-inary.github.io/postflop_solver/postflop_solver/"
 repository = "https://github.com/b-inary/postflop-solver"

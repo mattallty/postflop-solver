@@ -1,5 +1,17 @@
 name: Rust
-on: [push, pull_request]
+
+# `on: [push, pull_request]` ran every PR commit twice: once for the branch push and once
+# for the pull request. Limiting `push` to the default branch keeps post-merge coverage of
+# `main` while leaving branch commits to the `pull_request` trigger alone.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs when new commits land on the same branch or PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -10,11 +22,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
     - name: Install nightly
       run: |
         rustup toolchain install nightly
         rustup +nightly component add clippy
+    # Caches ~/.cargo and target/. Must run after the toolchains are installed, since the
+    # cache key includes the rustc version. Dependencies (notably zstd, which builds C code)
+    # dominate a cold build.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: build
     - name: Build
       run: |
         cargo build --release --features zstd
@@ -35,3 +53,21 @@ jobs:
       run: cargo fmt --all --check
     - name: Check documentation
       run: cargo doc --release
+
+  # The `build` job above tracks whatever the runner's `stable` happens to be, so it cannot
+  # notice when a change quietly raises the minimum supported Rust version. This job pins the
+  # MSRV declared in Cargo.toml, and fails if the crate stops building on it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install MSRV toolchain
+      run: rustup toolchain install 1.97 --profile minimal
+    # Separate key from the `build` job: different toolchain, so different artifacts.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: msrv
+    - name: Build with MSRV
+      run: |
+        cargo +1.97 build --release --features zstd
+        cargo +1.97 test --release --features zstd
