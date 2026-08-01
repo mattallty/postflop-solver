@@ -1,0 +1,22 @@
+{
+  "oop_range": "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s",
+  "ip_range": "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+",
+  "flop": "Td9d6h",
+  "turn": "Qc",
+  "river": null,
+  "starting_pot": 200,
+  "effective_stack": 900,
+  "rake_rate": 0.0,
+  "rake_cap": 0.0,
+  "flop_bet_sizes": { "bet": "60%, e, a", "raise": "2.5x" },
+  "turn_bet_sizes": { "bet": "60%, e, a", "raise": "2.5x" },
+  "river_bet_sizes": { "bet": "60%, e, a", "raise": "2.5x" },
+  "turn_donk_sizes": null,
+  "river_donk_sizes": "50%",
+  "add_allin_threshold": 1.5,
+  "force_allin_threshold": 0.15,
+  "merging_threshold": 0.1,
+  "max_num_iterations": 1000,
+  "target_exploitability_ratio": 0.005,
+  "use_compression": false
+}
