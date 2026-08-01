@@ -63,12 +63,12 @@ impl<T: ?Sized> MutexLike<T> {
     /// assert_eq!(*mutex_like.lock(), 10);
     /// ```
     #[inline]
-    pub fn lock(&self) -> MutexGuardLike<T> {
+    pub fn lock(&self) -> MutexGuardLike<'_, T> {
         MutexGuardLike { mutex: self }
     }
 }
 
-impl<T: ?Sized + Default> Default for MutexLike<T> {
+impl<T: Default> Default for MutexLike<T> {
     #[inline]
     fn default() -> Self {
         Self::new(Default::default())

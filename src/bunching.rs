@@ -727,7 +727,7 @@ impl BunchingData {
 
                     let mut src_mask_bit = [0; K];
                     for i in 0..K {
-                        let lsb = src_mask_copy & src_mask_copy.wrapping_neg();
+                        let lsb = src_mask_copy.isolate_lowest_one();
                         src_mask_copy ^= lsb;
                         src_mask_bit[i] = lsb;
                     }
@@ -779,7 +779,7 @@ impl BunchingData {
 
                     let mut mask_bit = [0; N];
                     for i in 0..N {
-                        let lsb = mask_copy & mask_copy.wrapping_neg();
+                        let lsb = mask_copy.isolate_lowest_one();
                         mask_copy ^= lsb;
                         mask_bit[i] = lsb;
                     }
