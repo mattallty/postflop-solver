@@ -35,3 +35,17 @@ jobs:
       run: cargo fmt --all --check
     - name: Check documentation
       run: cargo doc --release
+
+  # The `build` job above tracks whatever the runner's `stable` happens to be, so it cannot
+  # notice when a change quietly raises the minimum supported Rust version. This job pins the
+  # MSRV declared in Cargo.toml, and fails if the crate stops building on it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install MSRV toolchain
+      run: rustup toolchain install 1.97 --profile minimal
+    - name: Build with MSRV
+      run: |
+        cargo +1.97 build --release --features zstd
+        cargo +1.97 test --release --features zstd

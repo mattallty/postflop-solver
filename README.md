@@ -36,13 +36,15 @@ See [CHANGES.md](CHANGES.md) for the upstream list of breaking changes.
 postflop-solver = { git = "https://github.com/mattallty/postflop-solver" }
 ```
 
-The crate builds on a **recent** stable toolchain (this is what CI builds against). Older
-stables fail: `src/bunching.rs` uses `u64::isolate_lowest_one` and `src/atomic_float.rs` uses
-`AtomicU64::try_update`, both of which stabilized after 1.90. If `cargo build` errors with
-`use of unstable library feature` or `no method named isolate_lowest_one`, run
-`rustup update stable`.
+**Minimum supported Rust version: 1.97** (declared as `rust-version` in `Cargo.toml` and
+enforced by the `msrv` CI job). The crate uses `u64::isolate_lowest_one` and
+`AtomicU64::try_update`, which stabilized in 1.97.
 
-The optional `custom-alloc` feature additionally requires nightly.
+If `cargo build` fails with `use of unstable library feature` or `no method named
+isolate_lowest_one`, your toolchain is older than that — run `rustup update stable`.
+
+The optional `custom-alloc` feature additionally requires nightly. Everything else, including
+the full test suite, works on stable.
 
 - Examples
 
