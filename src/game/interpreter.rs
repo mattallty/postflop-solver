@@ -67,6 +67,70 @@ impl PostFlopGame {
         }
     }
 
+    /// Recursively visits every node in the subtree rooted at the current node, calling
+    /// `visitor` once for each node (including the current node itself) before descending into
+    /// its children.
+    ///
+    /// While `visitor` is executing, the game is positioned at the node being visited, so you can
+    /// call methods such as [`is_terminal_node`], [`is_chance_node`], [`available_actions`],
+    /// [`current_player`], [`history`], [`strategy`], or [`expected_values`] from within it.
+    /// This is useful for tasks such as collecting statistics about the tree, exporting a custom
+    /// summary of the solution, or (with [`lock_current_strategy`]) pruning low-value lines.
+    ///
+    /// After this method returns, the current node is restored to whatever it was before the
+    /// call, i.e., calling this method does not change the current node.
+    ///
+    /// Panics if the memory is not yet allocated.
+    ///
+    /// **Note:** this method navigates the tree using [`apply_history`] internally, so its total
+    /// cost is *O*(sum of the depths of all visited nodes) rather than *O*(number of nodes). It
+    /// is intended for analysis and tooling rather than for use in hot loops on very large trees.
+    ///
+    /// [`is_terminal_node`]: #method.is_terminal_node
+    /// [`is_chance_node`]: #method.is_chance_node
+    /// [`available_actions`]: #method.available_actions
+    /// [`current_player`]: #method.current_player
+    /// [`history`]: #method.history
+    /// [`strategy`]: #method.strategy
+    /// [`expected_values`]: #method.expected_values
+    /// [`lock_current_strategy`]: #method.lock_current_strategy
+    /// [`apply_history`]: #method.apply_history
+    pub fn visit<F: FnMut(&mut Self)>(&mut self, mut visitor: F) {
+        if self.state < State::MemoryAllocated {
+            panic!("Memory is not allocated");
+        }
+
+        let start_history = self.history().to_vec();
+        self.visit_recursive(&mut visitor);
+        self.apply_history(&start_history);
+    }
+
+    /// Helper for [`visit`] that performs the actual recursive traversal.
+    ///
+    /// [`visit`]: #method.visit
+    fn visit_recursive<F: FnMut(&mut Self)>(&mut self, visitor: &mut F) {
+        visitor(self);
+
+        if self.is_terminal_node() {
+            return;
+        }
+
+        // For chance nodes, `play` expects the actual dealt card rather than an index into
+        // `available_actions`, so extract the card from each `Action::Chance` entry.
+        let is_chance = self.is_chance_node();
+        let actions = self.available_actions();
+        let history = self.history().to_vec();
+
+        for (index, action) in actions.iter().enumerate() {
+            self.apply_history(&history);
+            match (is_chance, action) {
+                (true, Action::Chance(card)) => self.play(*card as usize),
+                _ => self.play(index),
+            }
+            self.visit_recursive(visitor);
+        }
+    }
+
     /// Returns whether the current node is a terminal node.
     ///
     /// Note that the turn/river node after the call action after the all-in action is considered

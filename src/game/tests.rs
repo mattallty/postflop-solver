@@ -1248,3 +1248,55 @@ fn solve_pio_preset_raked() {
     assert!((root_ev_oop - 95.57).abs() < 0.2);
     assert!((root_ev_ip - 66.98).abs() < 0.2);
 }
+
+#[test]
+fn visit_all_nodes() {
+    let card_config = CardConfig {
+        range: [Range::ones(); 2],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 60,
+        effective_stack: 970,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    // Move to a non-root node beforehand to check that `visit` restores the current position.
+    game.play(0);
+    let history_before = game.history().to_vec();
+
+    let mut num_nodes = 0;
+    let mut num_terminal = 0;
+    let mut num_chance = 0;
+    let mut num_player = 0;
+
+    game.visit(|g| {
+        num_nodes += 1;
+        if g.is_terminal_node() {
+            num_terminal += 1;
+        } else if g.is_chance_node() {
+            num_chance += 1;
+        } else {
+            num_player += 1;
+            assert!(!g.available_actions().is_empty());
+        }
+    });
+
+    // `visit` must not change the current node.
+    assert_eq!(game.history(), history_before.as_slice());
+
+    // sanity checks: the subtree rooted at the current node (after the first "check") should
+    // contain a mix of player, chance, and terminal nodes.
+    assert_eq!(num_nodes, num_terminal + num_chance + num_player);
+    assert!(num_terminal > 0);
+    assert!(num_chance > 0);
+    assert!(num_player > 0);
+}
