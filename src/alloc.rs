@@ -29,11 +29,13 @@ struct StackAllocData {
 }
 
 thread_local! {
-    static STACK_ALLOC_DATA: RefCell<StackAllocData> = RefCell::new(StackAllocData {
-        index: usize::MAX,
-        base: Vec::new(),
-        current: Vec::new(),
-    });
+    static STACK_ALLOC_DATA: RefCell<StackAllocData> = const {
+        RefCell::new(StackAllocData {
+            index: usize::MAX,
+            base: Vec::new(),
+            current: Vec::new(),
+        })
+    };
 }
 
 impl StackAllocData {

@@ -128,14 +128,14 @@ fn slice_absolute_max(slice: &[f32]) -> f32 {
     } else {
         let mut tmp: [f32; 8] = slice[..8].try_into().unwrap();
         tmp.iter_mut().for_each(|x| *x = x.abs());
-        let mut iter = slice[8..].chunks_exact(8);
-        for chunk in iter.by_ref() {
+        let (chunks, remainder) = slice[8..].as_chunks::<8>();
+        for chunk in chunks {
             for i in 0..8 {
                 tmp[i] = max(tmp[i], chunk[i].abs());
             }
         }
         let tmpmax = tmp.iter().fold(0.0f32, |a, &x| max(a, x));
-        iter.remainder().iter().fold(tmpmax, |a, x| max(a, x.abs()))
+        remainder.iter().fold(tmpmax, |a, x| max(a, x.abs()))
     }
 }
 
@@ -191,14 +191,14 @@ fn slice_nonnegative_max(slice: &[f32]) -> f32 {
         slice.iter().fold(0.0, |a, &x| max(a, x))
     } else {
         let mut tmp: [f32; 8] = slice[..8].try_into().unwrap();
-        let mut iter = slice[8..].chunks_exact(8);
-        for chunk in iter.by_ref() {
+        let (chunks, remainder) = slice[8..].as_chunks::<8>();
+        for chunk in chunks {
             for i in 0..8 {
                 tmp[i] = max(tmp[i], chunk[i]);
             }
         }
         let tmpmax = tmp.iter().fold(0.0f32, |a, &x| max(a, x));
-        iter.remainder().iter().fold(tmpmax, |a, &x| max(a, x))
+        remainder.iter().fold(tmpmax, |a, &x| max(a, x))
     }
 }
 
