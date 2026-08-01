@@ -15,6 +15,12 @@ jobs:
       run: |
         rustup toolchain install nightly
         rustup +nightly component add clippy
+    # Caches ~/.cargo and target/. Must run after the toolchains are installed, since the
+    # cache key includes the rustc version. Dependencies (notably zstd, which builds C code)
+    # dominate a cold build.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: build
     - name: Build
       run: |
         cargo build --release --features zstd
@@ -45,6 +51,10 @@ jobs:
     - uses: actions/checkout@v7
     - name: Install MSRV toolchain
       run: rustup toolchain install 1.97 --profile minimal
+    # Separate key from the `build` job: different toolchain, so different artifacts.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: msrv
     - name: Build with MSRV
       run: |
         cargo +1.97 build --release --features zstd
