@@ -1,5 +1,7 @@
 use super::*;
+use crate::interface::Game;
 use crate::range::*;
+use crate::save_data_into_std_write;
 use crate::solver::*;
 use crate::utility::*;
 use crate::BunchingData;
@@ -1299,4 +1301,67 @@ fn visit_all_nodes() {
     assert!(num_terminal > 0);
     assert!(num_chance > 0);
     assert!(num_player > 0);
+}
+
+#[test]
+fn free_memory() {
+    let card_config = CardConfig {
+        range: [Range::ones(); 2],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 60,
+        effective_stack: 970,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    // freeing memory before it is allocated is a no-op
+    game.free_memory();
+    assert_eq!(game.is_memory_allocated(), None);
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    assert_eq!(game.is_memory_allocated(), Some(false));
+    assert!(game.is_solved());
+    let (uncompressed, _) = game.memory_usage();
+    assert!(uncompressed > 0);
+
+    game.cache_normalized_weights();
+    let weights_oop = game.normalized_weights(0);
+    let ev_oop_before = compute_average(&game.expected_values(0), weights_oop);
+
+    game.free_memory();
+
+    // the tree/config metadata must be preserved
+    assert_eq!(game.card_config().flop, flop_from_str("Td9d6h").unwrap());
+    assert_eq!(game.tree_config().starting_pot, 60);
+    assert_eq!(game.memory_usage(), (uncompressed, game.memory_usage().1));
+
+    // the storage and solved status must be reset
+    assert_eq!(game.is_memory_allocated(), None);
+    assert!(!game.is_solved());
+
+    // freeing again is a no-op
+    game.free_memory();
+    assert_eq!(game.is_memory_allocated(), None);
+
+    // saving must fail gracefully once the memory is freed
+    let mut buf = Vec::new();
+    assert!(save_data_into_std_write(&game, "", &mut buf, None).is_err());
+
+    // the game can be fully reallocated and re-solved afterward
+    game.allocate_memory(false);
+    finalize(&mut game);
+    assert!(game.is_solved());
+
+    game.cache_normalized_weights();
+    let weights_oop = game.normalized_weights(0);
+    let ev_oop_after = compute_average(&game.expected_values(0), weights_oop);
+    assert!((ev_oop_after - ev_oop_before).abs() < 1e-4);
 }
