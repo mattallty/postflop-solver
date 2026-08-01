@@ -65,6 +65,8 @@ mod bet_size;
 mod bunching;
 mod card;
 mod game;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 mod hand;
 mod hand_table;
 mod interface;

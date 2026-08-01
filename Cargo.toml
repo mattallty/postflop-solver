@@ -15,6 +15,12 @@ rayon = { version = "1.8.0", optional = true }
 regex = "1.9.6"
 zstd = { version = "0.12.4", optional = true, default-features = false }
 
+# Optional GPU backend (see the `gpu` feature). Kept out of the default build so that
+# neither compile time nor the dependency tree changes for users who do not want it.
+bytemuck = { version = "1", optional = true }
+pollster = { version = "1", optional = true }
+wgpu = { version = "30", optional = true }
+
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,3 +29,11 @@ serde_json = "1"
 default = ["bincode", "rayon"]
 custom-alloc = []
 rayon = ["dep:rayon", "zstd?/zstdmt"]
+# Experimental GPU acceleration for the bunching-effect terminal evaluation.
+# Disabled by default. Enabling it never makes the GPU mandatory: the backend is probed at
+# runtime and the CPU path is used whenever no compatible device is available.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[[example]]
+name = "gpu_spike"
+required-features = ["gpu"]
