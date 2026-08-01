@@ -22,6 +22,7 @@ jobs:
         cargo run --release --example basic
         cargo run --release --example file_io
         cargo run --release --example node_locking
+        cargo run --release --example from_config
     - name: Run tests
       run: |
         cargo test --release --features zstd

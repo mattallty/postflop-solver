@@ -43,6 +43,13 @@ If you have cloned this repository, you can run the example with the following c
 $ cargo run --release --example basic
 ```
 
+You can also drive the solver from an external JSON configuration file instead of
+hard-coding it, using the `from_config` example:
+
+```sh
+$ cargo run --release --example from_config -- examples/config.json
+```
+
 ## Implementation details
 
 - **Algorithm**: The solver uses the state-of-the-art [Discounted CFR] algorithm.
