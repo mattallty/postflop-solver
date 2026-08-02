@@ -5,6 +5,8 @@ use crate::save_data_into_std_write;
 use crate::solver::*;
 use crate::utility::*;
 use crate::BunchingData;
+use crate::{load_data_from_std_read, BetSizeOptions};
+use std::collections::HashSet;
 
 #[test]
 fn all_check_all_range() {
@@ -1279,9 +1281,11 @@ fn visit_all_nodes() {
     let mut num_terminal = 0;
     let mut num_chance = 0;
     let mut num_player = 0;
+    let mut histories = HashSet::new();
 
     game.visit(|g| {
         num_nodes += 1;
+        histories.insert(g.history().to_vec());
         if g.is_terminal_node() {
             num_terminal += 1;
         } else if g.is_chance_node() {
@@ -1295,12 +1299,222 @@ fn visit_all_nodes() {
     // `visit` must not change the current node.
     assert_eq!(game.history(), history_before.as_slice());
 
+    // every node must be visited exactly once
+    assert_eq!(num_nodes, histories.len());
+
+    // every visited node must be a descendant of the starting node
+    assert!(histories.iter().all(|h| h.starts_with(&history_before)));
+
     // sanity checks: the subtree rooted at the current node (after the first "check") should
     // contain a mix of player, chance, and terminal nodes.
     assert_eq!(num_nodes, num_terminal + num_chance + num_player);
     assert!(num_terminal > 0);
     assert!(num_chance > 0);
     assert!(num_player > 0);
+}
+
+/// Builds a deliberately tiny river game whose whole tree can be enumerated by hand:
+///
+/// ```text
+/// []      OOP: Check | Bet(30)
+/// [0]      |- OOP checks -> IP: Check | Bet(30)
+/// [0,0]    |   |- IP checks -> showdown
+/// [0,1]    |   `- IP bets   -> OOP: Fold | Call
+/// [0,1,0]  |       |- OOP folds
+/// [0,1,1]  |       `- OOP calls
+/// [1]     `- OOP bets -> IP: Fold | Call
+/// [1,0]        |- IP folds
+/// [1,1]        `- IP calls
+/// ```
+///
+/// i.e. 9 nodes: 4 player nodes, 5 terminal nodes, and no chance node.
+fn tiny_river_game() -> PostFlopGame {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        // a single bet size and no raise size, so the tree stays hand-enumerable
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+        ],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+    game
+}
+
+#[test]
+fn visit_exact_node_set() {
+    let mut game = tiny_river_game();
+
+    let mut num_nodes = 0;
+    let mut num_terminal = 0;
+    let mut num_player = 0;
+    let mut histories = HashSet::new();
+
+    game.visit(|g| {
+        num_nodes += 1;
+        histories.insert(g.history().to_vec());
+        if g.is_terminal_node() {
+            num_terminal += 1;
+        } else {
+            assert!(!g.is_chance_node());
+            num_player += 1;
+        }
+    });
+
+    let expected: HashSet<Vec<usize>> = [
+        vec![],
+        vec![0],
+        vec![0, 0],
+        vec![0, 1],
+        vec![0, 1, 0],
+        vec![0, 1, 1],
+        vec![1],
+        vec![1, 0],
+        vec![1, 1],
+    ]
+    .into_iter()
+    .collect();
+
+    // the exact node set, so neither a missed node nor a node visited twice can pass
+    assert_eq!(histories, expected);
+    assert_eq!(num_nodes, 9);
+    assert_eq!(num_player, 4);
+    assert_eq!(num_terminal, 5);
+}
+
+#[test]
+fn visit_with_navigating_visitor() {
+    let mut game = tiny_river_game();
+
+    let mut baseline = Vec::new();
+    game.visit(|g| baseline.push(g.history().to_vec()));
+
+    // a visitor that navigates the tree must not affect which nodes are visited
+    let mut visited = Vec::new();
+    game.visit(|g| {
+        visited.push(g.history().to_vec());
+        g.back_to_root();
+        if !g.is_terminal_node() {
+            g.play(0);
+        }
+    });
+
+    assert_eq!(visited, baseline);
+    assert_eq!(visited.len(), 9);
+    assert!(game.history().is_empty());
+}
+
+#[test]
+fn visit_reads_expected_values() {
+    let mut game = tiny_river_game();
+
+    // `expected_values` is usable from within a visitor as long as the visitor caches the
+    // normalized weights itself, since navigating to a node invalidates them
+    let mut num_evs = 0;
+    game.visit(|g| {
+        if !g.is_terminal_node() && !g.is_chance_node() {
+            g.cache_normalized_weights();
+            let player = g.current_player();
+            assert_eq!(
+                g.expected_values(player).len(),
+                g.private_cards(player).len()
+            );
+            assert_eq!(g.equity(player).len(), g.private_cards(player).len());
+            num_evs += 1;
+        }
+    });
+
+    assert_eq!(num_evs, 4);
+}
+
+#[test]
+fn visit_with_reduced_storage() {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: 60,
+        effective_stack: 60,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    // full-storage traversal descends past the river deal
+    let mut full_chance = 0;
+    let mut full_nodes = 0;
+    game.visit(|g| {
+        full_nodes += 1;
+        if g.is_chance_node() {
+            full_chance += 1;
+        }
+    });
+    assert!(full_chance > 0);
+
+    // discard the storage after the river deal
+    let mut buf = Vec::new();
+    game.set_target_storage_mode(BoardState::Turn).unwrap();
+    save_data_into_std_write(&game, "", &mut buf, None).unwrap();
+    let (mut truncated, _): (PostFlopGame, String) =
+        load_data_from_std_read(&mut buf.as_slice(), None).unwrap();
+
+    // the traversal must stop at the storage boundary rather than panic
+    let mut truncated_chance = 0;
+    let mut truncated_nodes = 0;
+    let mut chance_histories = Vec::new();
+    let mut all_histories = Vec::new();
+    truncated.visit(|g| {
+        truncated_nodes += 1;
+        all_histories.push(g.history().to_vec());
+        if g.is_chance_node() {
+            truncated_chance += 1;
+            chance_histories.push(g.history().to_vec());
+        }
+    });
+
+    // the chance nodes at the boundary are still visited, but nothing below them is
+    assert_eq!(truncated_chance, full_chance);
+    assert!(truncated_nodes < full_nodes);
+    assert!(!chance_histories.is_empty());
+
+    for chance in &chance_histories {
+        assert!(
+            !all_histories
+                .iter()
+                .any(|h| h.len() > chance.len() && h.starts_with(chance)),
+            "descended past the storage boundary at {chance:?}"
+        );
+    }
 }
 
 #[test]

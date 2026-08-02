@@ -73,18 +73,60 @@ impl PostFlopGame {
     ///
     /// While `visitor` is executing, the game is positioned at the node being visited, so you can
     /// call methods such as [`is_terminal_node`], [`is_chance_node`], [`available_actions`],
-    /// [`current_player`], [`history`], [`strategy`], or [`expected_values`] from within it.
-    /// This is useful for tasks such as collecting statistics about the tree, exporting a custom
-    /// summary of the solution, or (with [`lock_current_strategy`]) pruning low-value lines.
+    /// [`current_player`], [`history`], or [`strategy`] from within it. This is useful for tasks
+    /// such as collecting statistics about the tree or exporting a custom summary of the solution.
+    ///
+    /// The visitor may also navigate the tree itself (for instance to inspect a sibling line);
+    /// the traversal restores the visited node afterwards, so doing so does not affect which
+    /// nodes are visited.
     ///
     /// After this method returns, the current node is restored to whatever it was before the
     /// call, i.e., calling this method does not change the current node.
     ///
-    /// Panics if the memory is not yet allocated.
+    /// # Reading equities and expected values
     ///
-    /// **Note:** this method navigates the tree using [`apply_history`] internally, so its total
-    /// cost is *O*(sum of the depths of all visited nodes) rather than *O*(number of nodes). It
-    /// is intended for analysis and tooling rather than for use in hot loops on very large trees.
+    /// Moving to a node invalidates the cached normalized weights, so [`equity`],
+    /// [`expected_values`], and [`expected_values_detail`] panic unless the visitor calls
+    /// [`cache_normalized_weights`] itself first:
+    ///
+    /// ```ignore
+    /// game.visit(|g| {
+    ///     if !g.is_terminal_node() && !g.is_chance_node() {
+    ///         g.cache_normalized_weights();
+    ///         let ev = g.expected_values(g.current_player());
+    ///         // ...
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// This is left to the visitor rather than done once per node because it is wasted work for
+    /// visitors that do not need it, and is *O*(#(OOP private hands) * #(IP private hands)) when
+    /// bunching is enabled.
+    ///
+    /// # Locking strategies
+    ///
+    /// Reading expected values and locking strategies cannot be combined in a single pass:
+    /// [`expected_values`] requires a solved game, while [`lock_current_strategy`] panics on one.
+    /// Pruning low-value lines therefore takes two passes — one [`visit`] to collect the EVs of
+    /// the solved game keyed by [`history`], then, after rebuilding or reloading the game so that
+    /// it is no longer in the solved state, a second [`visit`] that applies the locks.
+    ///
+    /// # Reduced storage
+    ///
+    /// If the game has a reduced storage mode (see [`set_target_storage_mode`]), the traversal
+    /// visits the chance nodes at the storage boundary but does not descend past them, since the
+    /// data for the following street is not present.
+    ///
+    /// # Cost
+    ///
+    /// This method navigates the tree using [`apply_history`] internally, so its total cost is
+    /// *O*(sum of the depths of all visited nodes) rather than *O*(number of nodes). It is
+    /// intended for analysis and tooling rather than for use in hot loops on very large trees;
+    /// in particular, it is impractical on a full flop tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memory is not yet allocated.
     ///
     /// [`is_terminal_node`]: #method.is_terminal_node
     /// [`is_chance_node`]: #method.is_chance_node
@@ -92,9 +134,14 @@ impl PostFlopGame {
     /// [`current_player`]: #method.current_player
     /// [`history`]: #method.history
     /// [`strategy`]: #method.strategy
+    /// [`equity`]: #method.equity
     /// [`expected_values`]: #method.expected_values
+    /// [`expected_values_detail`]: #method.expected_values_detail
+    /// [`cache_normalized_weights`]: #method.cache_normalized_weights
     /// [`lock_current_strategy`]: #method.lock_current_strategy
+    /// [`visit`]: #method.visit
     /// [`apply_history`]: #method.apply_history
+    /// [`set_target_storage_mode`]: #method.set_target_storage_mode
     pub fn visit<F: FnMut(&mut Self)>(&mut self, mut visitor: F) {
         if self.state < State::MemoryAllocated {
             panic!("Memory is not allocated");
@@ -109,7 +156,15 @@ impl PostFlopGame {
     ///
     /// [`visit`]: #method.visit
     fn visit_recursive<F: FnMut(&mut Self)>(&mut self, visitor: &mut F) {
+        let history = self.history().to_vec();
+
         visitor(self);
+
+        // The visitor is free to navigate the tree (e.g., to inspect a sibling line), so the
+        // current node must be restored before reading anything from it.
+        if self.history() != history {
+            self.apply_history(&history);
+        }
 
         if self.is_terminal_node() {
             return;
@@ -118,8 +173,11 @@ impl PostFlopGame {
         // For chance nodes, `play` expects the actual dealt card rather than an index into
         // `available_actions`, so extract the card from each `Action::Chance` entry.
         let is_chance = self.is_chance_node();
+        if is_chance && !self.can_play_chance_node() {
+            return;
+        }
+
         let actions = self.available_actions();
-        let history = self.history().to_vec();
 
         for (index, action) in actions.iter().enumerate() {
             self.apply_history(&history);
@@ -129,6 +187,18 @@ impl PostFlopGame {
             }
             self.visit_recursive(visitor);
         }
+    }
+
+    /// Returns whether the current chance node can be played through with the current storage
+    /// mode, i.e., whether the storage of the next street is available.
+    ///
+    /// Must only be called at a chance node. This mirrors the check performed by [`play`].
+    ///
+    /// [`play`]: #method.play
+    #[inline]
+    fn can_play_chance_node(&self) -> bool {
+        let is_turn = self.turn == NOT_DEALT;
+        self.storage_mode != BoardState::Flop && (is_turn || self.storage_mode != BoardState::Turn)
     }
 
     /// Returns whether the current node is a terminal node.
