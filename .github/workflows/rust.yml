@@ -81,7 +81,7 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install MSRV toolchain
-      run: rustup toolchain install 1.97 --profile minimal --component clippy rustfmt
+      run: rustup toolchain install 1.97 --profile minimal --component clippy
     - uses: Swatinem/rust-cache@v2
       with:
         key: sidecar
