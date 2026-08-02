@@ -80,6 +80,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        # `engine_rev` compares the engine's `src/` against the commit ENGINE_REV names, which a
+        # shallow clone does not contain. The test skips rather than fails when it is missing, so
+        # without this the check would quietly become a no-op here — which is the failure mode it
+        # exists to prevent.
+        fetch-depth: 0
     - name: Install MSRV toolchain
       run: rustup toolchain install 1.97 --profile minimal --component clippy
     - uses: Swatinem/rust-cache@v2

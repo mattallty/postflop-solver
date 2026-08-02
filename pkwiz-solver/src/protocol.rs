@@ -34,20 +34,23 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Reported by `version` so a saved solution can be traced to the engine that produced it, and
 /// checked by a host against [`ENGINE_COMPATIBLE_REVS`] before it offers to reopen a stored tree.
 ///
-/// # This is the one constant nothing enforces
+/// # How this is kept honest
 ///
-/// It used to be kept honest by construction: the sidecar lived in another repository and named
-/// the engine as a git dependency, so this string and the `rev =` in its manifest were the same
-/// commit or the build was wrong. Sharing a repository with the engine removes that check — a
-/// path dependency has no revision to disagree with — and buys, in exchange, that the two can no
-/// longer be at different commits at all.
+/// It used to be honest by construction: the sidecar lived in another repository and named the
+/// engine as a git dependency, so this string and the `rev =` in its manifest were the same
+/// commit or the build did not resolve. Sharing a repository with the engine removed that check —
+/// a path dependency has no revision to disagree with — and left a bare `&'static str` that any
+/// change to the engine could quietly falsify.
 ///
-/// What is left to get wrong is this string going stale. **A change to the engine that alters
-/// what a solve computes or how a solution is written must update it**, and add the previous
-/// value to [`ENGINE_COMPATIBLE_REVS`] if stored trees are still readable. A change that does
-/// neither — a lint fix, a new method, a doc edit — should leave it alone: bumping it needlessly
-/// is not harmless, because a host that keys "can I open this file?" on an exact match would mark
-/// a whole library of saved solves unreadable.
+/// `tests/engine_rev.rs` puts the check back: it fails when the engine's `src/` has moved since
+/// the commit named here. So changing the engine forces a decision rather than allowing an
+/// oversight — update this to the new commit, and add the old value to
+/// [`ENGINE_COMPATIBLE_REVS`] if solutions written by it are still readable.
+///
+/// The test deliberately ignores changes to *this* directory. The sidecar is expected to move on
+/// its own, and bumping the engine revision for a protocol change would be a lie in the other
+/// direction — a host that keys "can I open this file?" on an exact match would mark a whole
+/// library of saved solves unreadable for a change that never touched the engine.
 pub const ENGINE_REV: &str = "5e3de32ad2cf848b6a33db4a2a806e5f8dca7f51";
 
 /// The version string the engine stamps into every solution it writes.
