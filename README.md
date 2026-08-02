@@ -137,6 +137,46 @@ accuracy tests and the bunching tests still pass.
 [rayon]: https://github.com/rayon-rs/rayon
 [zstd]: https://github.com/gyscos/zstd-rs
 
+## The `pkwiz-solver` sidecar
+
+`pkwiz-solver/` is a second crate in this repository: a standalone binary that drives this engine
+and speaks newline-delimited JSON on stdin/stdout.
+
+```text
+-> {"id":1,"cmd":"solve","spot":{"oop":"QQ+","ip":"JJ+","board":"Td9d6h","pot":100,
+                                 "effectiveStack":300}}
+<- {"id":1,"ok":true,"result":{"jobId":1,"phase":"queued",…}}
+<- {"event":"job","job":{"jobId":1,"phase":"running","iterations":40,"exploitability":2.1,…}}
+```
+
+It exists because of the licence. This engine is AGPL-3.0, so an application that is not itself
+AGPL cannot link it — but it can run a separate program that does, and talk to it over a pipe.
+That program is built and published **here**, from [the releases page][releases], and an
+application downloads it. No AGPL code is redistributed by the application, and no type from this
+engine ever crosses the pipe.
+
+The arrangement earns its keep beyond the licensing: a solve is minutes of numerical code, so its
+own address space means a crash costs one job rather than the host, and the engine underneath is
+swappable.
+
+Ranges and cards come from [`pkwiz-range`][pkwiz-range] (MIT) rather than from this crate's own
+`Range`, so the sidecar and whatever drives it expand `JTs-67s` with the same parser. Two copies
+of that grammar would agree right up until they did not, and the disagreement would be a solve
+against the wrong range rather than an error.
+
+```sh
+cargo build --release -p pkwiz-solver
+./target/release/pkwiz-solver --version
+```
+
+Releases are tagged `sidecar-v*` and carry one archive per platform — macOS (Apple Silicon and
+Intel), Linux (x64 and ARM64) and Windows (x64 and **ARM64**, built natively rather than left to
+emulation, because a CFR loop is arithmetic end to end) — each with its SHA-256. Pin the digest:
+one served from the same place as the file it describes attests to nothing.
+
+[releases]: https://github.com/mattallty/postflop-solver/releases
+[pkwiz-range]: https://github.com/mattallty/pkwiz-range
+
 ## License
 
 Copyright (C) 2022 Wataru Inariba

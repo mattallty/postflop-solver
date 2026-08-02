@@ -1,0 +1,163 @@
+name: Release the solver sidecar
+
+# Builds `pkwiz-solver` for every supported platform and attaches the archives to a release.
+#
+# The sidecar exists so that an application which is not AGPL can still offer solves: it links the
+# engine, it is published here, and the application downloads it. That makes these artifacts the
+# distribution boundary — so the job that produces them is deliberately boring and reproducible,
+# and every archive is accompanied by its SHA-256, because the consumer pins that digest and
+# refuses anything else.
+on:
+  push:
+    tags: ['sidecar-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. sidecar-v0.1.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not deprive the release of the others; the digests are
+      # collected at the end and a missing one is visible there.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          # Native ARM64 Windows, not a cross-compile. Windows runs x64 binaries under emulation,
+          # so this is not about compatibility — it is about speed. A CFR loop is arithmetic from
+          # start to finish, which is the worst case for emulation, and "the solver is slow" is
+          # how that would be reported rather than "the solver is emulated".
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchain for ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Every host here builds its own architecture, so this is never a cross-compile. That
+      # matters for more than tidiness: `zstd-sys` compiles C, and a native build needs no
+      # cross toolchain and no linker configuration to get wrong.
+      - name: Build
+        run: cargo build --release --locked -p pkwiz-solver --target ${{ matrix.target }}
+
+      # Proves the artifact runs on the machine that built it before it is ever published. It is
+      # also exactly the handshake the consumer performs after downloading, so a binary that would
+      # be rejected there is rejected here instead.
+      - name: Check it runs
+        run: ./target/${{ matrix.target }}/release/pkwiz-solver --version
+        shell: bash
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="pkwiz-solver-${{ matrix.target }}"
+          bin="pkwiz-solver"
+          [[ "${{ matrix.target }}" == *windows* ]] && bin="pkwiz-solver.exe"
+
+          # The binary sits at the archive root: the consumer looks for it there and nowhere else.
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/$bin" "$staging/$bin"
+
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            archive="$name.zip"
+            (cd "$staging" && 7z a -tzip "$OLDPWD/$archive" "$bin" >/dev/null)
+          else
+            archive="$name.tar.gz"
+            tar -czf "$archive" -C "$staging" "$bin"
+          fi
+
+          # shasum is present on every runner image; sha256sum is not (macOS).
+          digest=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          echo "$digest  $archive" > "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### $archive" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$digest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The digests are the whole point of the release: a consumer commits them and refuses
+      # anything else, so they have to be readable without downloading the archives first.
+      - name: Collect the digests
+        id: digests
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          echo "Published archives and their SHA-256:"
+          cat SHA256SUMS
+          {
+            echo '## Checksums'
+            echo
+            echo 'Pin these. A digest served from the same place as the file it describes attests'
+            echo 'to nothing, so a consumer should carry them in its own source.'
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          body_path: dist/SHA256SUMS
+          fail_on_unmatched_files: true

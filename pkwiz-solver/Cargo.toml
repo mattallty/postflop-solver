@@ -1,0 +1,40 @@
+[package]
+name = "pkwiz-solver"
+version = "0.1.0"
+edition = "2021"
+# Set by the engine next door, which uses `AtomicU64::try_update` and `u64::isolate_lowest_one`.
+rust-version = "1.97"
+authors = ["Matt <matthias@etienne.in>"]
+description = "A standalone GTO solver sidecar over `postflop-solver`, speaking JSON on stdio"
+repository = "https://github.com/mattallty/postflop-solver"
+# AGPL because it links the engine. That is the whole point of it being here rather than in the
+# application that drives it: this binary is built and published by the AGPL project, and the
+# application downloads it. See the README.
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "pkwiz_solver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pkwiz-solver"
+path = "src/main.rs"
+
+[dependencies]
+# The engine, from the repository this crate lives in. A path dependency rather than a git rev:
+# the two move together now, which is the reason for putting them in the same repo.
+#
+# `zstd` is on because a saved tree is the largest artefact this produces and the engine's file
+# format already carries a per-file compression flag, so it costs nothing on read — a file written
+# before it was enabled still opens, its flag byte saying "none".
+postflop-solver = { path = "..", features = ["zstd"] }
+
+# Cards and range notation, MIT. Shared with the application that drives this sidecar so that both
+# sides expand `JTs-67s` with the same parser: two copies of that grammar would agree right up
+# until they did not, and the disagreement would be a wrong solve rather than an error.
+pkwiz-range = { git = "https://github.com/mattallty/pkwiz-range", rev = "da93f48a58580d57b9ba20e5ad2bf6292569176a" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

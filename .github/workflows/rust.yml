@@ -71,3 +71,30 @@ jobs:
       run: |
         cargo +1.97 build --release --features zstd
         cargo +1.97 test --release --features zstd
+
+  # The `build` job above runs at the repository root, which is the engine's own package — a root
+  # package that is also a workspace root keeps `cargo build`/`test`/`clippy` there targeting the
+  # engine alone. The sidecar therefore needs asking for by name, or it would go untested.
+  sidecar:
+    name: sidecar
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install MSRV toolchain
+      run: rustup toolchain install 1.97 --profile minimal --component clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: sidecar
+    - name: Build and test
+      run: |
+        cargo +1.97 build --release -p pkwiz-solver
+        cargo +1.97 test --release -p pkwiz-solver
+    # `-A needless_range_loop` for the same reason the engine's own clippy step carries it: the
+    # engine is a workspace member now, so linting the sidecar lints it too, and its indexed loops
+    # are deliberate.
+    - name: Clippy
+      run: cargo +1.97 clippy --release -p pkwiz-solver --all-targets -- -D warnings -A clippy::needless_range_loop
+    # The release artifacts are what an application downloads, and it probes them with exactly
+    # this before trusting one. Failing here beats failing on a user's machine.
+    - name: It answers --version
+      run: ./target/release/pkwiz-solver --version

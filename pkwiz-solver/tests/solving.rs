@@ -1,0 +1,716 @@
+//! Does the solver actually solve?
+//!
+//! Three things are worth asserting about a CFR implementation you did not write, and none of
+//! them need a reference solver:
+//!
+//! 1. **Exploitability falls.** That is the entire claim of the algorithm. If it does not fall,
+//!    nothing else about the output means anything.
+//! 2. **Symmetry is respected.** Spots exist whose answer is forced by the shape of the problem —
+//!    identical ranges must have identical equity; a board that makes every hand a chop must
+//!    produce zero EV for both players. Those are checkable exactly.
+//! 3. **Stopping stops.** A cancel that only takes effect when the solve would have finished
+//!    anyway is not a cancel.
+//!
+//! Everything here is deliberately tiny: river trees over nine to eighteen combinations, tens of
+//! iterations. The engine's own suite already checks its numbers against PioSOLVER (
+//! four `--ignored` tests, 357 s); repeating that in CI would buy nothing and cost minutes.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use pkwiz_solver::spot::{BoardSpec, RangeSpec, Sizing, StreetSizing};
+use pkwiz_solver::{Collector, JobStatus, Jobs, Phase, Silent, Spot, Stop, Stopped};
+
+/// A river spot: no chance nodes, so the tree is as small as a real spot gets.
+fn river(board: &str, range: &str, iterations: u32) -> Spot {
+    Spot {
+        oop: RangeSpec::Notation(range.to_owned()),
+        ip: RangeSpec::Notation(range.to_owned()),
+        board: BoardSpec::Text(board.to_owned()),
+        pot: 100,
+        effective_stack: 100,
+        sizing: Sizing {
+            flop: StreetSizing::none(),
+            turn: StreetSizing::none(),
+            river: StreetSizing {
+                bet: "50%".to_owned(),
+                raise: "2.5x".to_owned(),
+            },
+            ..Sizing::default()
+        },
+        rake: pkwiz_solver::spot::Rake::default(),
+        stop: Stop {
+            max_iterations: iterations,
+            // Zero, so the iteration cap is what stops it and the test controls the runtime
+            // exactly rather than depending on how fast this spot happens to converge.
+            target_exploitability: Some(0.0),
+            target_exploitability_pct: 0.0,
+            check_interval: 5,
+        },
+        compress: false,
+        max_memory_bytes: None,
+        save_path: None,
+        compression_level: Spot::default_compression_level(),
+        memo: None,
+    }
+}
+
+/// Block until the job is terminal, or fail.
+fn finish(jobs: &Jobs, id: u64, within: Duration) -> JobStatus {
+    let deadline = Instant::now() + within;
+    loop {
+        let status = jobs.status(id).expect("the job exists");
+        if status.phase.is_terminal() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job {id} still {:?} after {within:?}",
+            status.phase
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A directory of this test's own, so the file-shaped tests can run alongside each other and clean
+/// up after themselves without deleting anyone else's fixtures.
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pkwiz-solver-{}-{label}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn solve(spot: Spot) -> (Jobs, JobStatus) {
+    let jobs = Jobs::new(Arc::new(Silent));
+    let queued = jobs.submit(spot).expect("the spot is valid");
+    let done = finish(&jobs, queued.job_id, Duration::from_secs(60));
+    (jobs, done)
+}
+
+#[test]
+fn exploitability_falls_which_is_the_whole_claim_of_cfr() {
+    let (_jobs, done) = solve(river("2c7dTh4sQd", "QQ+,AKs,76s", 200));
+
+    assert_eq!(done.phase, Phase::Done);
+    assert_eq!(done.stopped, Some(Stopped::IterationCap));
+    assert_eq!(done.iterations, 200);
+
+    let history = &done.history;
+    assert!(history.len() > 10, "expected a curve, got {history:?}");
+    let first = history[0].exploitability;
+    let last = history.last().unwrap().exploitability;
+
+    // Two orders of magnitude over two hundred iterations on a tree this small. A broken solver
+    // fails this by miles; a merely slow one still passes, which is the right sensitivity.
+    assert!(
+        last < first / 100.0,
+        "exploitability went {first} -> {last}"
+    );
+
+    // Monotone, but at the right resolution. Discounted CFR is *not* monotone iteration to
+    // iteration — it resets its cumulative strategy whenever the iteration count reaches a power
+    // of four, and the measurement right after a reset routinely jumps by 4×. Asserting
+    // `history[i+1] <= history[i]` would therefore assert something false about a working solver.
+    //
+    // What is true, and what convergence actually means, is that each stretch of the run is
+    // decisively better than the last. Quartered, this run goes 8.0 -> 0.84 -> 0.23 -> 0.098.
+    let quarter = history.len() / 4;
+    let means: Vec<f32> = (0..4)
+        .map(|q| {
+            let slice = &history[q * quarter..(q + 1) * quarter];
+            slice.iter().map(|s| s.exploitability).sum::<f32>() / slice.len() as f32
+        })
+        .collect();
+    for pair in means.windows(2) {
+        assert!(
+            pair[1] < pair[0] / 2.0,
+            "exploitability stalled across the run: {means:?} from {history:?}"
+        );
+    }
+
+    // Zero-sum without rake, which is a free arithmetic check on the finalized values.
+    let ev = done.ev.expect("a finished job has EVs");
+    assert!((ev[0] + ev[1]).abs() < 0.01, "{ev:?} is not zero-sum");
+}
+
+#[test]
+fn a_tree_with_no_betting_is_solved_before_it_starts() {
+    // The strongest forced answer available: if neither player may bet, the only line is
+    // check-check, so no strategy exists to exploit and exploitability is exactly zero. With
+    // identical ranges the spot is also symmetric, so each player's EV is exactly half the pot —
+    // reported as zero, because `compute_current_ev` subtracts that bias.
+    let mut spot = river("2c7dTh4sQd", "QQ+", 50);
+    spot.sizing.river = StreetSizing::none();
+    spot.sizing.add_allin_threshold = 0.0;
+    spot.sizing.force_allin_threshold = 0.0;
+
+    let (jobs, done) = solve(spot);
+    assert_eq!(done.phase, Phase::Done);
+    // Zero up to f32 rounding on a sum over nine hands; the engine reports -7e-7 here.
+    assert!(
+        done.exploitability.unwrap().abs() < 1e-4,
+        "a game with no decisions cannot be exploited, got {:?}",
+        done.exploitability
+    );
+
+    let ev = done.ev.unwrap();
+    assert!(ev[0].abs() < 1e-3 && ev[1].abs() < 1e-3, "{ev:?}");
+
+    // And the two players hold the same equity, because they hold the same range.
+    let oop = jobs.node(done.job_id, &[]).unwrap();
+    assert_eq!(oop.player, Some(0));
+    assert!(
+        (oop.average_equity - 0.5).abs() < 1e-4,
+        "{}",
+        oop.average_equity
+    );
+    // The whole tree is one action for each player.
+    assert_eq!(oop.actions, ["Check"]);
+    let ip = jobs.node(done.job_id, &[0]).unwrap();
+    assert_eq!(ip.player, Some(1));
+    assert!((ip.average_equity - 0.5).abs() < 1e-4);
+}
+
+#[test]
+fn a_board_that_chops_every_hand_forces_the_answer() {
+    // A royal flush on the board: every hand plays the board, so all equity is 50% no matter what
+    // anyone holds, and folding is strictly dominated — it turns a guaranteed chop into a
+    // guaranteed loss of half the pot. Nothing about that depends on a reference solver.
+    let (jobs, done) = solve(river("AsKsQsJsTs", "QQ+", 300));
+    assert_eq!(done.phase, Phase::Done);
+
+    let ev = done.ev.unwrap();
+    assert!(
+        ev[0].abs() < 0.5 && ev[1].abs() < 0.5,
+        "nobody can profit from a chopped board, got {ev:?}"
+    );
+
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    assert!((root.average_equity - 0.5).abs() < 1e-4);
+    // Every single hand, not just the average.
+    assert!(
+        root.equity.iter().all(|e| (e - 0.5).abs() < 1e-4),
+        "some hand beats a royal flush: {:?}",
+        root.equity
+    );
+
+    // Facing a bet, folding a chop is giving away half the pot, so the equilibrium folds ~never.
+    let bet = root
+        .actions
+        .iter()
+        .position(|a| a.starts_with("Bet") || a.starts_with("AllIn"))
+        .expect("the river tree offers a bet");
+    let facing = jobs.node(done.job_id, &[bet]).unwrap();
+    assert_eq!(facing.player, Some(1));
+    let fold = facing
+        .actions
+        .iter()
+        .position(|a| a == "Fold")
+        .expect("facing a bet, folding is an option");
+    let worst = facing.strategy[fold]
+        .iter()
+        .fold(0.0f32, |acc, f| acc.max(*f));
+    assert!(
+        worst < 0.05,
+        "some hand folds a guaranteed chop {worst} of the time"
+    );
+}
+
+#[test]
+fn cancel_stops_the_work_rather_than_the_reporting() {
+    // A million iterations on a tiny tree: minutes of work, so a cancel that only took effect at
+    // the end would be unmissable here.
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs,76s", 1_000_000);
+    spot.stop.check_interval = 20;
+
+    let jobs = Jobs::new(Arc::new(Silent));
+    let queued = jobs.submit(spot).expect("valid");
+    let id = queued.job_id;
+
+    // Wait until it is genuinely iterating, so we are cancelling work and not a queue entry.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = jobs.status(id).unwrap();
+        if status.phase == Phase::Running && status.iterations >= 20 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never started: {status:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let asked = Instant::now();
+    let after = jobs.cancel(id).unwrap();
+    let ack = asked.elapsed();
+    assert!(
+        ack < Duration::from_millis(100),
+        "cancel blocked for {ack:?}; it must not wait for the solver"
+    );
+    assert!(!after.phase.is_terminal(), "it was still running");
+
+    let done = finish(&jobs, id, Duration::from_secs(5));
+    let stopped = asked.elapsed();
+    assert_eq!(done.phase, Phase::Cancelled);
+    assert_eq!(done.stopped, Some(Stopped::Cancelled));
+    assert!(
+        stopped < Duration::from_secs(5),
+        "took {stopped:?} to actually stop"
+    );
+    assert!(
+        done.iterations < 100_000,
+        "ran {} of a million iterations, which is not cancelling",
+        done.iterations
+    );
+
+    // Cancelled early, but still finalized: the point of a stop button is to keep what you have.
+    let root = jobs.node(id, &[]).unwrap();
+    assert!(!root.strategy.is_empty());
+    assert!(root.strategy[0].len() == root.hands.len());
+}
+
+#[test]
+fn cancelling_a_queued_job_never_starts_it() {
+    let jobs = Jobs::new(Arc::new(Silent));
+    // The first job occupies the single worker; the second is cancelled while still queued.
+    let first = jobs
+        .submit(river("2c7dTh4sQd", "QQ+,AKs,76s", 200_000))
+        .unwrap();
+    let second = jobs.submit(river("2c7dTh4sQd", "QQ+", 200_000)).unwrap();
+    assert_eq!(second.phase, Phase::Queued);
+
+    let cancelled = jobs.cancel(second.job_id).unwrap();
+    assert_eq!(cancelled.phase, Phase::Cancelled);
+    assert_eq!(cancelled.iterations, 0);
+
+    jobs.cancel(first.job_id).unwrap();
+    finish(&jobs, first.job_id, Duration::from_secs(10));
+    // Still zero after the worker has drained the queue: it was skipped, not run.
+    assert_eq!(jobs.status(second.job_id).unwrap().iterations, 0);
+    assert_eq!(jobs.list().len(), 2);
+}
+
+#[test]
+fn progress_is_pushed_while_the_solve_runs_not_only_at_the_end() {
+    let collector = Arc::new(Collector::default());
+    let jobs = Jobs::with_throttle(
+        Arc::clone(&collector) as Arc<dyn pkwiz_solver::Emit>,
+        Duration::ZERO,
+    );
+    let id = jobs
+        .submit(river("2c7dTh4sQd", "QQ+,AKs,76s", 400))
+        .unwrap()
+        .job_id;
+    finish(&jobs, id, Duration::from_secs(60));
+
+    let events = collector.events();
+    assert!(events.len() > 5, "only {} frames pushed", events.len());
+    assert_eq!(events[0]["job"]["phase"], "queued");
+    assert_eq!(events.last().unwrap()["job"]["phase"], "done");
+
+    // Iterations climb across the frames, which is the property a progress bar needs and that
+    // a single terminal frame would satisfy vacuously.
+    let iterations: Vec<u64> = events
+        .iter()
+        .map(|e| e["job"]["iterations"].as_u64().unwrap())
+        .collect();
+    assert!(
+        iterations.windows(2).all(|w| w[0] <= w[1]),
+        "{iterations:?}"
+    );
+    assert!(
+        iterations.iter().any(|i| *i > 0 && *i < 400),
+        "no frame arrived mid-solve: {iterations:?}"
+    );
+    // Every frame is a complete status, not a delta.
+    assert!(events
+        .iter()
+        .all(|e| e["job"]["jobId"] == id && e["job"]["startingPot"] == 100));
+}
+
+#[test]
+fn a_solution_survives_a_round_trip_through_a_file() {
+    let dir = temp_dir("round-trip");
+    let path = dir.join("round-trip.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs", 40);
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+    spot.memo = Some("hand #4471, river".to_owned());
+
+    let (jobs, done) = solve(spot);
+    assert_eq!(done.saved_to.as_deref(), Some(&*path.to_string_lossy()));
+    assert!(done.error.is_none(), "{:?}", done.error);
+    let before = jobs.node(done.job_id, &[]).unwrap();
+
+    let reopened = jobs.open(&path.to_string_lossy()).unwrap();
+    assert_eq!(reopened.phase, Phase::Done);
+    assert_ne!(reopened.job_id, done.job_id);
+    let after = jobs.node(reopened.job_id, &[]).unwrap();
+
+    assert_eq!(after.hands, before.hands);
+    assert_eq!(after.strategy, before.strategy);
+    assert_eq!(after.equity, before.equity);
+    // The engine sorts the flop (it derives suit isomorphism from that order) and leaves the turn
+    // and river where they are, so `2c7dTh4sQd` reads back in exactly this order.
+    assert_eq!(after.board, ["2c", "7d", "Th", "4s", "Qd"]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_saved_solution_is_compressed_and_the_raw_form_still_opens() {
+    let dir = temp_dir("compression");
+    let compressed = dir.join("compressed.bin");
+    let raw = dir.join("raw.bin");
+
+    let mut spot = river("2c7dTh4sQd", "22+,A2s+", 20);
+    spot.save_path = Some(compressed.to_string_lossy().into_owned());
+
+    let (jobs, done) = solve(spot);
+    assert!(done.error.is_none(), "{:?}", done.error);
+    let before = jobs.node(done.job_id, &[]).unwrap();
+
+    // The same tree written without compression, for something to compare against.
+    pkwiz_solver::engine::save(
+        &pkwiz_solver::engine::load(&compressed.to_string_lossy())
+            .unwrap()
+            .0,
+        &raw.to_string_lossy(),
+        "",
+        None,
+    )
+    .unwrap();
+
+    let small = std::fs::metadata(&compressed).unwrap().len();
+    let large = std::fs::metadata(&raw).unwrap().len();
+    assert!(
+        small < large,
+        "compressed {small} is not smaller than raw {large}"
+    );
+
+    // Both forms open, and to the same strategy. The uncompressed one is the shape every file
+    // written before this was turned on has, so this is also the back-compatibility check.
+    for path in [&compressed, &raw] {
+        let reopened = jobs.open(&path.to_string_lossy()).unwrap();
+        let after = jobs.node(reopened.job_id, &[]).unwrap();
+        assert_eq!(after.strategy, before.strategy, "{}", path.display());
+        assert_eq!(after.equity, before.equity, "{}", path.display());
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn solution_files_carry_the_format_version_we_claim() {
+    // `protocol::ENGINE_FORMAT` duplicates a string the engine keeps private and refuses to decode
+    // a mismatch of, so `ENGINE_COMPATIBLE_REVS` is only as good as that duplicate being right.
+    // The engine stamps it into the body of every file it writes, which makes the claim checkable:
+    // written raw, the bytes are there to be found.
+    let dir = temp_dir("format");
+    let path = dir.join("stamped.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+", 10);
+    spot.compression_level = None;
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+
+    let (_jobs, done) = solve(spot);
+    assert!(done.error.is_none(), "{:?}", done.error);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let stamp = pkwiz_solver::protocol::ENGINE_FORMAT.as_bytes();
+    assert!(
+        bytes.windows(stamp.len()).any(|w| w == stamp),
+        "no {:?} in the file the engine just wrote — ENGINE_FORMAT has drifted from the engine",
+        pkwiz_solver::protocol::ENGINE_FORMAT
+    );
+
+    // And the revision we claim compatibility with is a superset of the one we are built on.
+    assert!(pkwiz_solver::protocol::ENGINE_COMPATIBLE_REVS
+        .contains(&pkwiz_solver::protocol::ENGINE_REV));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn releasing_a_saved_job_hands_back_its_tree_and_reading_it_reloads() {
+    let dir = temp_dir("release");
+    let path = dir.join("released.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs", 40);
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+
+    let (jobs, done) = solve(spot);
+    assert!(done.resident, "a job that just solved holds its tree");
+    let before = jobs.node(done.job_id, &[]).unwrap();
+
+    let released = jobs.release(done.job_id).unwrap();
+    assert!(!released.resident);
+    // Everything else about the job is exactly as it was: releasing is not forgetting.
+    assert_eq!(released.phase, done.phase);
+    assert_eq!(released.exploitability, done.exploitability);
+    assert_eq!(released.ev, done.ev);
+    assert_eq!(released.saved_to, done.saved_to);
+    assert_eq!(released.history, done.history);
+
+    // Releasing twice is a no-op, not an error.
+    assert!(!jobs.release(done.job_id).unwrap().resident);
+
+    // And the strategy is still readable, identically, because `node` reloads the file.
+    let after = jobs.node(done.job_id, &[]).unwrap();
+    assert_eq!(after.strategy, before.strategy);
+    assert_eq!(after.equity, before.equity);
+    assert_eq!(after.ev, before.ev);
+    assert!(
+        jobs.status(done.job_id).unwrap().resident,
+        "reading a released job puts it back in memory"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_job_with_no_file_behind_it_refuses_to_be_released() {
+    // The in-memory tree is the only copy, so dropping it would silently throw the solve away.
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+", 20));
+    assert!(done.saved_to.is_none());
+
+    let refused = jobs.release(done.job_id).unwrap_err();
+    assert_eq!(refused.code(), "not_recoverable");
+    assert!(
+        jobs.status(done.job_id).unwrap().resident,
+        "a refused release must not have released anything"
+    );
+    assert!(jobs.node(done.job_id, &[]).is_ok());
+}
+
+#[test]
+fn starting_a_solve_hands_back_the_trees_that_are_already_on_disk() {
+    // The reason any of this exists: an afternoon of solves should cost one tree of memory, not
+    // one per solve. A second solve is what triggers the release of the first.
+    let dir = temp_dir("release-others");
+    let saved_path = dir.join("saved.bin");
+
+    let jobs = Jobs::new(Arc::new(Silent));
+
+    let mut saved = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    saved.save_path = Some(saved_path.to_string_lossy().into_owned());
+    let first = finish(
+        &jobs,
+        jobs.submit(saved).unwrap().job_id,
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        first.resident,
+        "nothing has happened since, so the first solve still holds its tree"
+    );
+
+    // A second job, with nowhere to write: starting it releases the first, and it must itself
+    // survive every later sweep, because the tree in memory is the only copy of its answer.
+    let unsaved = finish(
+        &jobs,
+        jobs.submit(river("AsKsQsJsTs", "QQ+", 20)).unwrap().job_id,
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        !jobs.status(first.job_id).unwrap().resident,
+        "the saved job's tree should have been handed back when the next solve started"
+    );
+    assert!(jobs.status(unsaved.job_id).unwrap().resident);
+
+    let third = finish(
+        &jobs,
+        jobs.submit(river("2c7dTh4sQd", "KK+", 20)).unwrap().job_id,
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        jobs.status(unsaved.job_id).unwrap().resident,
+        "the unsaved job is the only copy of its answer and must be left alone"
+    );
+    assert!(
+        jobs.status(third.job_id).unwrap().resident,
+        "the job that just solved keeps its own tree"
+    );
+
+    // And all three answer, the released one by reloading its file.
+    assert!(jobs.node(first.job_id, &[]).is_ok());
+    assert!(jobs.node(unsaved.job_id, &[]).is_ok());
+    assert!(jobs.node(third.job_id, &[]).is_ok());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn opening_a_file_hands_back_the_trees_that_are_already_on_disk() {
+    // The browsing path, which never calls `solve`: a library walker only opens files. Sweeping on
+    // `solve` alone would leave this accumulating one tree per open — including opening the *same*
+    // file twice, which is two resident copies of one solution.
+    let dir = temp_dir("release-on-open");
+    let path = dir.join("browsed.bin");
+
+    let jobs = Jobs::new(Arc::new(Silent));
+
+    let mut saved = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    saved.save_path = Some(path.to_string_lossy().into_owned());
+    let solved = finish(
+        &jobs,
+        jobs.submit(saved).unwrap().job_id,
+        Duration::from_secs(60),
+    );
+    assert!(solved.resident);
+    let before = jobs.node(solved.job_id, &[]).unwrap();
+
+    // First open: the solve's own tree goes back.
+    let first = jobs.open(&path.to_string_lossy()).unwrap();
+    assert!(first.resident);
+    assert!(
+        !jobs.status(solved.job_id).unwrap().resident,
+        "opening a file should have handed back the solved job's tree"
+    );
+
+    // Second open of the same file: the first opened job goes back too, rather than the session
+    // holding two copies of one solution.
+    let second = jobs.open(&path.to_string_lossy()).unwrap();
+    assert_ne!(second.job_id, first.job_id);
+    assert!(
+        !jobs.status(first.job_id).unwrap().resident,
+        "a second open should have handed back the first opened tree"
+    );
+    assert!(jobs.status(second.job_id).unwrap().resident);
+
+    // All three still answer, and with the same strategy.
+    for id in [solved.job_id, first.job_id, second.job_id] {
+        let view = jobs.node(id, &[]).unwrap();
+        assert_eq!(view.strategy, before.strategy, "job {id}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_tree_too_big_for_its_budget_is_refused_with_a_number() {
+    let mut spot = river("2c7dTh4sQd", "22+,A2s+,K2s+", 10);
+    spot.max_memory_bytes = Some(1024);
+
+    let jobs = Jobs::new(Arc::new(Silent));
+    let id = jobs.submit(spot.clone()).unwrap().job_id;
+    let done = finish(&jobs, id, Duration::from_secs(30));
+
+    assert_eq!(done.phase, Phase::Failed);
+    let message = done.error.expect("a failure says why");
+    assert!(message.contains("maxMemoryBytes"), "{message}");
+    assert!(message.contains("1024"), "{message}");
+
+    // And the estimate answers the same question without allocating or failing.
+    let estimate = pkwiz_solver::engine::estimate(&spot).unwrap();
+    assert!(estimate.uncompressed > 1024);
+    assert!(estimate.compressed < estimate.uncompressed);
+}
+
+#[test]
+fn node_queries_are_refused_until_there_is_something_to_read() {
+    let jobs = Jobs::new(Arc::new(Silent));
+    let id = jobs
+        .submit(river("2c7dTh4sQd", "QQ+", 1_000_000))
+        .unwrap()
+        .job_id;
+
+    let err = jobs.node(id, &[]).unwrap_err();
+    assert_eq!(err.code(), "not_readable");
+    assert!(jobs.node(9999, &[]).unwrap_err().code() == "no_such_job");
+
+    // Cancel only once it is genuinely iterating: a job cancelled while still queued never gets a
+    // game at all, and would answer `not_readable` for the rest of its life — correctly, but that
+    // is a different assertion than the one this test is making.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while jobs.status(id).unwrap().iterations == 0 {
+        assert!(Instant::now() < deadline, "never started");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    jobs.cancel(id).unwrap();
+    finish(&jobs, id, Duration::from_secs(10));
+
+    // And a history that does not describe a node is a reportable error, not a panic.
+    let err = jobs.node(id, &[99]).unwrap_err();
+    assert_eq!(err.code(), "bad_node");
+    assert!(err.to_string().contains("out of range"), "{err}");
+}
+
+/// Realistic flop solves, for the record rather than for CI.
+///
+/// `cargo test -p pkwiz-solver --release -- --ignored --nocapture` prints how long a spot of the
+/// size someone would actually ask for takes, and to what exploitability. The ranges and the
+/// board are `postflop-solver`'s own `basic.rs` example, so the numbers are comparable to the
+/// engine's published ones; the two sizings are our default and that example's richer tree.
+#[test]
+#[ignore = "tens of seconds to minutes — this is the benchmark, not a check"]
+fn a_realistic_flop_solve() {
+    let base = Spot {
+        oop: RangeSpec::Notation(
+            "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s".to_owned(),
+        ),
+        ip: RangeSpec::Notation(
+            "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+".to_owned(),
+        ),
+        board: BoardSpec::Text("Td9d6h".to_owned()),
+        pot: 200,
+        effective_stack: 900,
+        sizing: Sizing::default(),
+        rake: pkwiz_solver::spot::Rake::default(),
+        stop: Stop {
+            max_iterations: 1000,
+            target_exploitability: None,
+            // The industry convention: 0.5% of the pot.
+            target_exploitability_pct: 0.5,
+            check_interval: 10,
+        },
+        compress: false,
+        max_memory_bytes: Some(32 * 1024 * 1024 * 1024),
+        save_path: None,
+        compression_level: Spot::default_compression_level(),
+        memo: None,
+    };
+
+    for (label, sizing) in [
+        ("default (50% bet, 2.5x raise)", Sizing::default()),
+        (
+            "rich (60%, geometric, all-in; 2.5x raise)",
+            Sizing {
+                flop: StreetSizing {
+                    bet: "60%, e, a".to_owned(),
+                    raise: "2.5x".to_owned(),
+                },
+                turn: StreetSizing {
+                    bet: "60%, e, a".to_owned(),
+                    raise: "2.5x".to_owned(),
+                },
+                river: StreetSizing {
+                    bet: "60%, e, a".to_owned(),
+                    raise: "2.5x".to_owned(),
+                },
+                ..Sizing::default()
+            },
+        ),
+    ] {
+        let spot = Spot {
+            sizing,
+            ..base.clone()
+        };
+        let estimate = pkwiz_solver::engine::estimate(&spot).unwrap();
+        let started = Instant::now();
+        let (_jobs, done) = solve(spot);
+        println!(
+            "{label}: {:.2} GB ({:.2} GB compressed) | {:?} after {} iterations in {:.1}s | \
+             exploitability {:.4} vs target {:.4} | ev {:?}",
+            estimate.uncompressed as f64 / 1e9,
+            estimate.compressed as f64 / 1e9,
+            done.stopped,
+            done.iterations,
+            started.elapsed().as_secs_f64(),
+            done.exploitability.unwrap(),
+            done.target_exploitability,
+            done.ev.unwrap(),
+        );
+        assert_eq!(done.phase, Phase::Done);
+    }
+}
