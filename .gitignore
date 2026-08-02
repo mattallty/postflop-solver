@@ -1,2 +1,8 @@
 /target
-Cargo.lock
+
+# Cargo.lock is committed, which is a change from when this repository held only a library.
+#
+# It now also builds `pkwiz-solver`, published as release binaries whose SHA-256 consumers pin in
+# their own source. A build that resolves dependencies differently from one run to the next
+# produces a different digest for the same tag, which is exactly the thing those consumers are
+# checking for. Committing the lockfile is what makes a rebuild of a tag reproduce its artifacts.
