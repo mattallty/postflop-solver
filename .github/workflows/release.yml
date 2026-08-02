@@ -101,8 +101,14 @@ jobs:
             tar -czf "$archive" -C "$staging" "$bin"
           fi
 
-          # shasum is present on every runner image; sha256sum is not (macOS).
-          digest=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          # Neither name is on every runner: macOS ships `shasum` (a Perl script) and no
+          # `sha256sum`; Linux and Git Bash on Windows ship `sha256sum` and no `shasum`. Assuming
+          # either one cost a release run, so ask instead.
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest=$(sha256sum "$archive" | cut -d' ' -f1)
+          else
+            digest=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          fi
           echo "$digest  $archive" > "$archive.sha256"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
