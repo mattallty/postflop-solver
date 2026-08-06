@@ -1,5 +1,5 @@
 use super::*;
-use crate::interface::Game;
+use crate::interface::{Game, GameNode};
 use crate::range::*;
 use crate::save_data_into_std_write;
 use crate::solver::*;
@@ -1550,7 +1550,15 @@ fn free_memory() {
     let weights_oop = game.normalized_weights(0);
     let ev_oop_before = compute_average(&game.expected_values(0), weights_oop);
 
+    // move off the root so that the cursor reset below is observable
+    game.play(0);
+    assert!(!game.history().is_empty());
+
     game.free_memory();
+
+    // the current node must be reset to the root: the position (and the weights and caches
+    // that came with it) was derived from the storage that no longer exists
+    assert!(game.history().is_empty());
 
     // the tree/config metadata must be preserved
     assert_eq!(game.card_config().flop, flop_from_str("Td9d6h").unwrap());
@@ -1578,4 +1586,124 @@ fn free_memory() {
     let weights_oop = game.normalized_weights(0);
     let ev_oop_after = compute_average(&game.expected_values(0), weights_oop);
     assert!((ev_oop_after - ev_oop_before).abs() < 1e-4);
+}
+
+#[test]
+fn visit_below_isomorphism_eliminated_turn_card() {
+    // A monotone flop makes the three non-flop suits isomorphic, so most turn cards are
+    // eliminated from `available_actions` in favor of a representative of another suit.
+    // Entering the subtree below such a card sets the internal suit swap, which the traversal
+    // must invert when it replays the chance actions it reads from the storage.
+    let card_config = CardConfig {
+        range: [Range::ones(); 2],
+        flop: flop_from_str("AsKsQs").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 60,
+        effective_stack: 970,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    // check/check to the turn chance node
+    game.play(0);
+    game.play(0);
+    assert!(game.is_chance_node());
+    let chance_history = game.history().to_vec();
+
+    let listed: HashSet<Card> = game
+        .available_actions()
+        .iter()
+        .map(|action| match action {
+            Action::Chance(card) => *card,
+            _ => unreachable!(),
+        })
+        .collect();
+
+    // a dealable turn card that isomorphism eliminated, and its listed same-rank representative
+    let possible = game.possible_cards();
+    let eliminated = (0..52)
+        .map(|card| card as Card)
+        .find(|card| possible & (1 << card) != 0 && !listed.contains(card))
+        .unwrap();
+    let representative = *listed
+        .iter()
+        .find(|&&card| card >> 2 == eliminated >> 2 && card != eliminated && card & 3 != 3)
+        .unwrap();
+
+    // `play` accepts the eliminated card and swaps suits internally; the traversal below it
+    // must stay in actual-card coordinates
+    game.play(eliminated as usize);
+    let mut num_nodes = 0;
+    game.visit(|g| {
+        num_nodes += 1;
+        let board = g.current_board();
+        assert_eq!(board[3], eliminated);
+        // each dealt river must be distinct from the actual board
+        let mut sorted = board.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), board.len());
+    });
+
+    // isomorphic subtrees must have the same shape
+    game.apply_history(&chance_history);
+    game.play(representative as usize);
+    let mut num_nodes_representative = 0;
+    game.visit(|_| num_nodes_representative += 1);
+
+    assert!(num_nodes > 1);
+    assert_eq!(num_nodes, num_nodes_representative);
+}
+
+#[test]
+fn node_storage_accessors_tolerate_unallocated_memory() {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+        ],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    // before `allocate_memory`, the storage pointers are unassigned: the safe accessors must
+    // return empty slices rather than fabricate ones no allocation backs
+    assert!(game.root().strategy().is_empty());
+    assert!(game.root().regrets().is_empty());
+    assert!(game.root().cfvalues().is_empty());
+    assert!(game.root().strategy_compressed().is_empty());
+    assert!(game.root().regrets_compressed().is_empty());
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+    assert!(!game.root().strategy().is_empty());
+
+    // after `free_memory`, the pointers are nulled again along with the freed storage
+    game.free_memory();
+    assert!(game.root().strategy().is_empty());
+    assert!(game.root().regrets().is_empty());
+    assert!(game.root().cfvalues().is_empty());
 }

@@ -325,7 +325,9 @@ impl PostFlopGame {
     /// [`memory_usage`]) are preserved, so calling [`allocate_memory`] again does not require
     /// rebuilding the game from scratch. After calling this method, [`is_memory_allocated`]
     /// returns `None`, [`is_solved`] returns `false`, and the game must be re-allocated (and
-    /// re-solved) before it can be queried or played again.
+    /// re-solved) before it can be queried or played again. The current node is reset to the
+    /// root, since the freed storage includes the data the position was derived from; the
+    /// history returned by [`history`] is therefore empty afterwards.
     ///
     /// Does nothing if the memory is not allocated yet.
     ///
@@ -336,6 +338,7 @@ impl PostFlopGame {
     /// [`allocate_memory`]: #method.allocate_memory
     /// [`is_memory_allocated`]: #method.is_memory_allocated
     /// [`is_solved`]: Game::is_solved
+    /// [`history`]: #method.history
     #[inline]
     pub fn free_memory(&mut self) {
         if self.state <= State::TreeBuilt {
@@ -344,6 +347,10 @@ impl PostFlopGame {
 
         self.clear_storage();
         self.state = State::TreeBuilt;
+
+        // The interpreter's position, weights, and caches were all derived from the storage
+        // that no longer exists; leaving them in place would let stale results be read back.
+        self.back_to_root();
     }
 
     /// Allocates the memory.
@@ -609,12 +616,24 @@ impl PostFlopGame {
     }
 
     /// Clears the storage.
-    #[inline]
+    ///
+    /// The nodes' storage pointers are nulled along with the buffers they point into, so that
+    /// the safe [`GameNode`] accessors observe the unallocated state instead of dangling into
+    /// freed memory. [`allocate_memory_nodes`] reassigns them when storage is next allocated.
+    ///
+    /// [`allocate_memory_nodes`]: #method.allocate_memory_nodes
     fn clear_storage(&mut self) {
         self.storage1 = Vec::new();
         self.storage2 = Vec::new();
         self.storage_ip = Vec::new();
         self.storage_chance = Vec::new();
+
+        for node in &self.node_arena {
+            let mut node = node.lock();
+            node.storage1 = std::ptr::null_mut();
+            node.storage2 = std::ptr::null_mut();
+            node.storage3 = std::ptr::null_mut();
+        }
     }
 
     /// Counts the number of nodes in the game tree.

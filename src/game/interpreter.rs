@@ -182,7 +182,18 @@ impl PostFlopGame {
         for (index, action) in actions.iter().enumerate() {
             self.apply_history(&history);
             match (is_chance, action) {
-                (true, Action::Chance(card)) => self.play(*card as usize),
+                // `prev_action` stores the card in storage coordinates, while `play` expects it
+                // in actual coordinates and converts by swapping the suits in
+                // `turn_swapped_suit`. That swap is an involution, so applying it here first
+                // yields the actual card whose conversion lands back on this child.
+                (true, Action::Chance(card)) => {
+                    let card = match self.turn_swapped_suit {
+                        Some((suit1, suit2)) if card & 3 == suit1 => card - suit1 + suit2,
+                        Some((suit1, suit2)) if card & 3 == suit2 => card + suit1 - suit2,
+                        _ => *card,
+                    };
+                    self.play(card as usize);
+                }
                 _ => self.play(index),
             }
             self.visit_recursive(visitor);

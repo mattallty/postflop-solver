@@ -3,6 +3,32 @@ use crate::interface::*;
 use std::ptr;
 use std::slice;
 
+/// Builds a storage slice, tolerating an unassigned pointer.
+///
+/// `len` is fixed at tree-build time, but the storage pointers are only assigned while memory
+/// is allocated: they are null before [`PostFlopGame::allocate_memory`] and after
+/// [`PostFlopGame::free_memory`]. The accessors below are safe and publicly reachable through
+/// the [`GameNode`] trait, so in that state they must return an empty slice rather than
+/// fabricate one that no allocation backs.
+#[inline]
+fn storage_slice<'a, T>(ptr: *const u8, len: usize) -> &'a [T] {
+    if ptr.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ptr as *const T, len) }
+    }
+}
+
+/// Mutable counterpart of [`storage_slice`].
+#[inline]
+fn storage_slice_mut<'a, T>(ptr: *mut u8, len: usize) -> &'a mut [T] {
+    if ptr.is_null() {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(ptr as *mut T, len) }
+    }
+}
+
 impl GameNode for PostFlopNode {
     #[inline]
     fn is_terminal(&self) -> bool {
@@ -41,32 +67,32 @@ impl GameNode for PostFlopNode {
 
     #[inline]
     fn strategy(&self) -> &[f32] {
-        unsafe { slice::from_raw_parts(self.storage1 as *const f32, self.num_elements as usize) }
+        storage_slice::<f32>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn strategy_mut(&mut self) -> &mut [f32] {
-        unsafe { slice::from_raw_parts_mut(self.storage1 as *mut f32, self.num_elements as usize) }
+        storage_slice_mut::<f32>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn regrets(&self) -> &[f32] {
-        unsafe { slice::from_raw_parts(self.storage2 as *const f32, self.num_elements as usize) }
+        storage_slice::<f32>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn regrets_mut(&mut self) -> &mut [f32] {
-        unsafe { slice::from_raw_parts_mut(self.storage2 as *mut f32, self.num_elements as usize) }
+        storage_slice_mut::<f32>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues(&self) -> &[f32] {
-        unsafe { slice::from_raw_parts(self.storage2 as *const f32, self.num_elements as usize) }
+        storage_slice::<f32>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_mut(&mut self) -> &mut [f32] {
-        unsafe { slice::from_raw_parts_mut(self.storage2 as *mut f32, self.num_elements as usize) }
+        storage_slice_mut::<f32>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
@@ -76,76 +102,72 @@ impl GameNode for PostFlopNode {
 
     #[inline]
     fn cfvalues_ip(&self) -> &[f32] {
-        unsafe { slice::from_raw_parts(self.storage3 as *const f32, self.num_elements_ip as usize) }
+        storage_slice::<f32>(self.storage3, self.num_elements_ip as usize)
     }
 
     #[inline]
     fn cfvalues_ip_mut(&mut self) -> &mut [f32] {
-        unsafe {
-            slice::from_raw_parts_mut(self.storage3 as *mut f32, self.num_elements_ip as usize)
-        }
+        storage_slice_mut::<f32>(self.storage3, self.num_elements_ip as usize)
     }
 
     #[inline]
     fn cfvalues_chance(&self) -> &[f32] {
-        unsafe { slice::from_raw_parts(self.storage1 as *const f32, self.num_elements as usize) }
+        storage_slice::<f32>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_chance_mut(&mut self) -> &mut [f32] {
-        unsafe { slice::from_raw_parts_mut(self.storage1 as *mut f32, self.num_elements as usize) }
+        storage_slice_mut::<f32>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn strategy_compressed(&self) -> &[u16] {
-        unsafe { slice::from_raw_parts(self.storage1 as *const u16, self.num_elements as usize) }
+        storage_slice::<u16>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn strategy_compressed_mut(&mut self) -> &mut [u16] {
-        unsafe { slice::from_raw_parts_mut(self.storage1 as *mut u16, self.num_elements as usize) }
+        storage_slice_mut::<u16>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn regrets_compressed(&self) -> &[i16] {
-        unsafe { slice::from_raw_parts(self.storage2 as *const i16, self.num_elements as usize) }
+        storage_slice::<i16>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn regrets_compressed_mut(&mut self) -> &mut [i16] {
-        unsafe { slice::from_raw_parts_mut(self.storage2 as *mut i16, self.num_elements as usize) }
+        storage_slice_mut::<i16>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_compressed(&self) -> &[i16] {
-        unsafe { slice::from_raw_parts(self.storage2 as *const i16, self.num_elements as usize) }
+        storage_slice::<i16>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_compressed_mut(&mut self) -> &mut [i16] {
-        unsafe { slice::from_raw_parts_mut(self.storage2 as *mut i16, self.num_elements as usize) }
+        storage_slice_mut::<i16>(self.storage2, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_ip_compressed(&self) -> &[i16] {
-        unsafe { slice::from_raw_parts(self.storage3 as *const i16, self.num_elements_ip as usize) }
+        storage_slice::<i16>(self.storage3, self.num_elements_ip as usize)
     }
 
     #[inline]
     fn cfvalues_ip_compressed_mut(&mut self) -> &mut [i16] {
-        unsafe {
-            slice::from_raw_parts_mut(self.storage3 as *mut i16, self.num_elements_ip as usize)
-        }
+        storage_slice_mut::<i16>(self.storage3, self.num_elements_ip as usize)
     }
 
     #[inline]
     fn cfvalues_chance_compressed(&self) -> &[i16] {
-        unsafe { slice::from_raw_parts(self.storage1 as *const i16, self.num_elements as usize) }
+        storage_slice::<i16>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
     fn cfvalues_chance_compressed_mut(&mut self) -> &mut [i16] {
-        unsafe { slice::from_raw_parts_mut(self.storage1 as *mut i16, self.num_elements as usize) }
+        storage_slice_mut::<i16>(self.storage1, self.num_elements as usize)
     }
 
     #[inline]
