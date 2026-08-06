@@ -44,6 +44,8 @@
 //!   than nothing.
 //! - Finished solutions can be written to disk and reopened as a job, so a host can offer a
 //!   library of past solves rather than only the one in flight.
+//! - A finished job the host is done with can be `forget`ten — the only way to free a tree that
+//!   was never saved, since `release` refuses to discard the sole copy of a solve.
 //!
 //! ## A host should treat this binary as optional
 //!
@@ -61,7 +63,7 @@ pub mod jobs;
 pub mod protocol;
 pub mod spot;
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
@@ -86,7 +88,7 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorBody {
     /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`, `engine`,
-    /// `nothing_to_save`, `serialize`, or `panic`.
+    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `serialize`, or `panic`.
     pub code: String,
     pub message: String,
 }
@@ -211,22 +213,93 @@ impl Session {
     /// Blank lines are ignored, so a host that terminates its writes with an extra newline does
     /// not get a spurious error back.
     ///
+    /// Framing failures are commands failing, not the session failing, per the contract above:
+    /// a line that is not UTF-8 is answered with `bad_request` (lossy-decoded JSON does not
+    /// parse) rather than ending the loop the way `BufRead::lines` would, and a line longer
+    /// than [`MAX_LINE_BYTES`] is discarded and answered with `bad_request` rather than growing
+    /// a buffer without bound while a broken host never sends its newline.
+    ///
     /// # Errors
     ///
     /// Only for I/O on the input stream itself.
-    pub fn run<R: BufRead>(&self, input: R) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let handled = self.handle_line(&line);
-            self.emit.emit(encode(&handled.response));
-            if handled.stop {
-                break;
+    pub fn run<R: BufRead>(&self, mut input: R) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        loop {
+            match read_frame(&mut input, &mut buf)? {
+                Frame::Eof => break,
+                Frame::Oversized => {
+                    let response = Response::err(
+                        None,
+                        "bad_request",
+                        format!("request line exceeds {MAX_LINE_BYTES} bytes and was discarded"),
+                    );
+                    self.emit.emit(encode(&response));
+                }
+                Frame::Line => {
+                    let line = String::from_utf8_lossy(&buf);
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let handled = self.handle_line(&line);
+                    self.emit.emit(encode(&handled.response));
+                    if handled.stop {
+                        break;
+                    }
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// The longest request line [`Session::run`] will buffer.
+///
+/// Generous — the largest legitimate command is a `solve` whose ranges are spelled out combo by
+/// combo, which is kilobytes — while still bounding what a host that never sends a newline can
+/// make this process hold.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One framing step of [`Session::run`].
+enum Frame {
+    /// `buf` holds a complete line, without its trailing newline.
+    Line,
+    /// The line outgrew [`MAX_LINE_BYTES`]; it has been consumed and discarded.
+    Oversized,
+    Eof,
+}
+
+/// Read one newline-terminated frame into `buf`, enforcing [`MAX_LINE_BYTES`].
+fn read_frame<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Frame> {
+    buf.clear();
+    let read = Read::take(&mut *input, MAX_LINE_BYTES as u64 + 1).read_until(b'\n', buf)?;
+    if read == 0 {
+        return Ok(Frame::Eof);
+    }
+
+    if buf.last() == Some(&b'\n') {
+        // The take limit is one over the cap, so a line whose newline arrived holds at most
+        // `MAX_LINE_BYTES` of content.
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        return Ok(Frame::Line);
+    }
+
+    if buf.len() <= MAX_LINE_BYTES {
+        // EOF fell in the middle of a line; treat what arrived as the final frame, the same
+        // way `BufRead::lines` does.
+        return Ok(Frame::Line);
+    }
+
+    // Too long and still no newline: swallow the rest of the line in bounded chunks.
+    let mut chunk = Vec::with_capacity(8 * 1024);
+    loop {
+        chunk.clear();
+        let read = Read::take(&mut *input, 8 * 1024).read_until(b'\n', &mut chunk)?;
+        if read == 0 || chunk.last() == Some(&b'\n') {
+            return Ok(Frame::Oversized);
+        }
     }
 }
 

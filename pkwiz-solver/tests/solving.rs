@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pkwiz_solver::spot::{BoardSpec, RangeSpec, Sizing, StreetSizing};
-use pkwiz_solver::{Collector, JobStatus, Jobs, Phase, Silent, Spot, Stop, Stopped};
+use pkwiz_solver::{
+    Collector, Emit, JobError, JobStatus, Jobs, Phase, Silent, Spot, Stop, Stopped,
+};
 
 /// A river spot: no chance nodes, so the tree is as small as a real spot gets.
 fn river(board: &str, range: &str, iterations: u32) -> Spot {
@@ -340,7 +342,7 @@ fn a_solution_survives_a_round_trip_through_a_file() {
     assert!(done.error.is_none(), "{:?}", done.error);
     let before = jobs.node(done.job_id, &[]).unwrap();
 
-    let reopened = jobs.open(&path.to_string_lossy()).unwrap();
+    let reopened = jobs.open(&path.to_string_lossy(), None).unwrap();
     assert_eq!(reopened.phase, Phase::Done);
     assert_ne!(reopened.job_id, done.job_id);
     let after = jobs.node(reopened.job_id, &[]).unwrap();
@@ -370,7 +372,7 @@ fn a_saved_solution_is_compressed_and_the_raw_form_still_opens() {
 
     // The same tree written without compression, for something to compare against.
     pkwiz_solver::engine::save(
-        &pkwiz_solver::engine::load(&compressed.to_string_lossy())
+        &pkwiz_solver::engine::load(&compressed.to_string_lossy(), None)
             .unwrap()
             .0,
         &raw.to_string_lossy(),
@@ -389,7 +391,7 @@ fn a_saved_solution_is_compressed_and_the_raw_form_still_opens() {
     // Both forms open, and to the same strategy. The uncompressed one is the shape every file
     // written before this was turned on has, so this is also the back-compatibility check.
     for path in [&compressed, &raw] {
-        let reopened = jobs.open(&path.to_string_lossy()).unwrap();
+        let reopened = jobs.open(&path.to_string_lossy(), None).unwrap();
         let after = jobs.node(reopened.job_id, &[]).unwrap();
         assert_eq!(after.strategy, before.strategy, "{}", path.display());
         assert_eq!(after.equity, before.equity, "{}", path.display());
@@ -561,7 +563,7 @@ fn opening_a_file_hands_back_the_trees_that_are_already_on_disk() {
     let before = jobs.node(solved.job_id, &[]).unwrap();
 
     // First open: the solve's own tree goes back.
-    let first = jobs.open(&path.to_string_lossy()).unwrap();
+    let first = jobs.open(&path.to_string_lossy(), None).unwrap();
     assert!(first.resident);
     assert!(
         !jobs.status(solved.job_id).unwrap().resident,
@@ -570,7 +572,7 @@ fn opening_a_file_hands_back_the_trees_that_are_already_on_disk() {
 
     // Second open of the same file: the first opened job goes back too, rather than the session
     // holding two copies of one solution.
-    let second = jobs.open(&path.to_string_lossy()).unwrap();
+    let second = jobs.open(&path.to_string_lossy(), None).unwrap();
     assert_ne!(second.job_id, first.job_id);
     assert!(
         !jobs.status(first.job_id).unwrap().resident,
@@ -713,4 +715,114 @@ fn a_realistic_flop_solve() {
         );
         assert_eq!(done.phase, Phase::Done);
     }
+}
+
+#[test]
+fn forget_discards_an_unsaved_job_and_its_row() {
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+", 30));
+    assert_eq!(done.phase, Phase::Done);
+    assert!(done.saved_to.is_none());
+
+    // `release` refuses an unsaved job — dropping its tree would discard the only copy — which
+    // without `forget` left every unsaved solve resident until the process exited.
+    assert_eq!(
+        jobs.release(done.job_id),
+        Err(JobError::NotRecoverable(done.job_id))
+    );
+
+    // `forget` is the deliberate discard: the response carries the final status, and then both
+    // the tree and the row are gone.
+    let last = jobs.forget(done.job_id).unwrap();
+    assert_eq!(last.phase, Phase::Done);
+    assert!(jobs.list().iter().all(|j| j.job_id != done.job_id));
+    assert_eq!(
+        jobs.status(done.job_id),
+        Err(JobError::NoSuchJob(done.job_id))
+    );
+    assert_eq!(
+        jobs.forget(done.job_id),
+        Err(JobError::NoSuchJob(done.job_id))
+    );
+}
+
+#[test]
+fn a_job_that_is_not_finished_refuses_to_be_forgotten() {
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs,76s", 1_000_000);
+    spot.stop.check_interval = 20;
+
+    let jobs = Jobs::new(Arc::new(Silent));
+    let id = jobs.submit(spot).expect("valid").job_id;
+
+    // While it is queued or running, `forget` must refuse: the worker would otherwise be left
+    // solving into a row that no longer exists.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = jobs.status(id).unwrap();
+        if status.phase == Phase::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never started: {status:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(jobs.forget(id), Err(JobError::NotFinished { .. })));
+
+    // Once terminal — here via cancel — it can go.
+    jobs.cancel(id).unwrap();
+    finish(&jobs, id, Duration::from_secs(10));
+    assert!(jobs.forget(id).is_ok());
+    assert_eq!(jobs.status(id), Err(JobError::NoSuchJob(id)));
+}
+
+#[test]
+fn open_refuses_a_file_bigger_than_its_budget() {
+    let dir = temp_dir("open-cap");
+    let path = dir.join("cap.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+    let (jobs, done) = solve(spot);
+    assert!(done.saved_to.is_some());
+
+    // A one-byte budget refuses any real tree — the same refusal-over-OOM-kill contract the
+    // solve path provides — while the default budget still opens it.
+    assert!(jobs.open(&path.to_string_lossy(), Some(1)).is_err());
+    assert!(jobs.open(&path.to_string_lossy(), None).is_ok());
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_terminal_frame_is_final_even_when_cancel_races_the_worker() {
+    // Cancel immediately after submitting, twenty times over: sometimes the cancel lands before
+    // the worker claims the job, sometimes after. Whichever way each race falls, no job may emit
+    // any frame after its terminal one — the bug this pins down had the worker hauling a job
+    // already announced as `cancelled` back to `building` and solving it anyway.
+    let collector = Arc::new(Collector::default());
+    let jobs = Jobs::with_throttle(Arc::clone(&collector) as Arc<dyn Emit>, Duration::ZERO);
+
+    let mut ids = Vec::new();
+    for _ in 0..20 {
+        let queued = jobs.submit(river("2c7dTh4sQd", "QQ+", 5)).unwrap();
+        jobs.cancel(queued.job_id).unwrap();
+        ids.push(queued.job_id);
+    }
+    for id in &ids {
+        finish(&jobs, *id, Duration::from_secs(60));
+    }
+
+    let mut terminal = std::collections::HashSet::new();
+    for event in collector.events() {
+        let job = &event["job"];
+        let id = job["jobId"].as_u64().unwrap();
+        let phase = job["phase"].as_str().unwrap();
+        assert!(
+            !terminal.contains(&id),
+            "job {id} emitted a `{phase}` frame after its terminal frame"
+        );
+        if matches!(phase, "done" | "cancelled" | "failed") {
+            terminal.insert(id);
+        }
+    }
+    // Every job ended exactly once.
+    assert_eq!(terminal.len(), ids.len());
 }
