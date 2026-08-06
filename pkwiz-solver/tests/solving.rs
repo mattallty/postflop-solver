@@ -54,6 +54,7 @@ fn river(board: &str, range: &str, iterations: u32) -> Spot {
         save_path: None,
         compression_level: Spot::default_compression_level(),
         memo: None,
+        locks: Vec::new(),
     }
 }
 
@@ -671,6 +672,7 @@ fn a_realistic_flop_solve() {
         save_path: None,
         compression_level: Spot::default_compression_level(),
         memo: None,
+        locks: Vec::new(),
     };
 
     for (label, sizing) in [
@@ -846,4 +848,157 @@ fn a_job_cancelled_while_queued_says_so_when_read() {
 
     jobs.cancel(first.job_id).unwrap();
     finish(&jobs, first.job_id, Duration::from_secs(10));
+}
+
+#[test]
+fn a_lock_pins_the_strategy_and_the_node_says_so() {
+    // Pin OOP's whole root range to pure Check; the solver must leave it there, optimize IP
+    // against it, and the node must report both the pinned frequencies and the lock itself.
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs,76s", 60);
+    // Learn the root shape first: actions and hand count.
+    let (jobs, done) = solve(spot.clone());
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    let num_actions = root.actions.len();
+    let num_hands = root.hands.len();
+    let check = root
+        .actions
+        .iter()
+        .position(|a| a == "Check")
+        .expect("the root offers Check");
+    assert!(!root.is_locked);
+
+    let mut strategy = vec![vec![0.0f32; num_hands]; num_actions];
+    strategy[check] = vec![1.0; num_hands];
+    spot.locks = vec![pkwiz_solver::Lock {
+        history: Vec::new(),
+        strategy,
+        hands: Some(root.hands.clone()),
+    }];
+
+    let (jobs, done) = solve(spot);
+    assert_eq!(done.phase, Phase::Done, "{:?}", done.error);
+    let locked = jobs.node(done.job_id, &[]).unwrap();
+    assert!(locked.is_locked);
+    for h in 0..num_hands {
+        assert!(
+            (locked.strategy[check][h] - 1.0).abs() < 1e-6,
+            "hand {h} was not pinned: {:?}",
+            locked.strategy
+        );
+    }
+    // Deeper nodes are not locked.
+    let after_check = jobs.node(done.job_id, &[check]).unwrap();
+    assert!(!after_check.is_locked);
+}
+
+#[test]
+fn a_structurally_bad_lock_fails_the_job_with_its_name() {
+    // Wrong dimensions can only be discovered against the built tree, so the job fails.
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    spot.locks = vec![pkwiz_solver::Lock {
+        history: Vec::new(),
+        strategy: vec![vec![1.0]], // 1x1 where the root needs actions x hands
+        hands: None,
+    }];
+    let jobs = Jobs::new(Arc::new(Silent));
+    let id = jobs.submit(spot).expect("syntactically fine").job_id;
+    let done = finish(&jobs, id, Duration::from_secs(30));
+    assert_eq!(done.phase, Phase::Failed);
+    let error = done.error.unwrap();
+    assert!(
+        error.contains("locks[0]") && error.contains("cannot be applied"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_syntactically_bad_lock_fails_the_command_not_the_job() {
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    spot.locks = vec![pkwiz_solver::Lock {
+        history: Vec::new(),
+        strategy: vec![vec![-0.5, 1.0]],
+        hands: None,
+    }];
+    let jobs = Jobs::new(Arc::new(Silent));
+    let err = jobs.submit(spot).unwrap_err();
+    assert!(
+        err.to_string().contains("locks[0]") && err.to_string().contains("non-negative"),
+        "{err}"
+    );
+    assert!(jobs.list().is_empty(), "no job row was created");
+}
+
+#[test]
+fn a_hands_guard_catches_an_order_mistake() {
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    let (jobs, done) = solve(spot.clone());
+    let root = jobs.node(done.job_id, &[]).unwrap();
+
+    let mut wrong_hands = root.hands.clone();
+    wrong_hands.reverse();
+    let num_actions = root.actions.len();
+    spot.locks = vec![pkwiz_solver::Lock {
+        history: Vec::new(),
+        strategy: vec![vec![1.0; root.hands.len()]; num_actions],
+        hands: Some(wrong_hands),
+    }];
+
+    let jobs = Jobs::new(Arc::new(Silent));
+    let id = jobs.submit(spot).unwrap().job_id;
+    let done = finish(&jobs, id, Duration::from_secs(30));
+    assert_eq!(done.phase, Phase::Failed);
+    assert!(done.error.unwrap().contains("hands["));
+}
+
+#[test]
+fn ev_detail_rows_match_actions_and_ev_is_their_strategy_weighted_average() {
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+,AKs,76s", 200));
+    let view = jobs.node(done.job_id, &[]).unwrap();
+
+    assert_eq!(view.ev_detail.len(), view.actions.len());
+    for row in &view.ev_detail {
+        assert_eq!(row.len(), view.hands.len());
+    }
+
+    // The engine computes ev as the strategy-weighted row-average of evDetail; pin the exact
+    // identity, which also catches any chunking or row-order mistake.
+    for h in 0..view.hands.len() {
+        let weighted: f32 = (0..view.actions.len())
+            .map(|a| view.strategy[a][h] * view.ev_detail[a][h])
+            .sum();
+        assert!(
+            (weighted - view.ev[h]).abs() < 1e-3,
+            "hand {h}: {weighted} vs {}",
+            view.ev[h]
+        );
+    }
+}
+
+#[test]
+fn a_fold_row_is_exactly_zero_and_empty_nodes_have_no_detail() {
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+,AKs,76s", 60));
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    let bet = root
+        .actions
+        .iter()
+        .position(|a| a.starts_with("Bet"))
+        .expect("the root offers a bet");
+
+    let facing = jobs.node(done.job_id, &[bet]).unwrap();
+    let fold = facing
+        .actions
+        .iter()
+        .position(|a| a == "Fold")
+        .expect("facing a bet offers Fold");
+    assert!(
+        facing.ev_detail[fold].iter().all(|&v| v == 0.0),
+        "fold EV is the engine's exact-zero convention: {:?}",
+        facing.ev_detail[fold]
+    );
+
+    // Terminal node: no detail, like the other per-hand arrays.
+    let terminal = jobs.node(done.job_id, &[bet, fold]).unwrap();
+    assert!(terminal.is_terminal);
+    assert!(terminal.ev_detail.is_empty());
+    assert!(!terminal.is_locked);
 }

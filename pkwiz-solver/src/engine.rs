@@ -47,6 +47,8 @@ pub enum EngineError {
     Save { path: String, reason: String },
     #[error("could not read a solution from `{path}`: {reason}")]
     Load { path: String, reason: String },
+    #[error("locks[{index}] cannot be applied: {reason}")]
+    Lock { index: usize, reason: String },
 }
 
 /// How much memory a tree would take, both ways.
@@ -61,16 +63,132 @@ pub struct MemoryEstimate {
     pub allocated: u64,
 }
 
-/// Build the game for a spot and allocate its storage.
+/// Build the game for a spot, allocate its storage, and pin any requested strategies.
 ///
 /// # Errors
 ///
-/// If the spot is invalid, the tree cannot be built, or it would need more memory than the spot
-/// allows.
+/// If the spot is invalid, the tree cannot be built, it would need more memory than the spot
+/// allows, or a lock cannot be applied to the tree that was built.
 pub fn build(spot: &Spot) -> Result<(PostFlopGame, MemoryEstimate), EngineError> {
     let (mut game, memory) = construct(spot)?;
     game.allocate_memory(spot.compress);
+    // After allocation (the engine refuses locks before it) and before the CFR loop (it
+    // refuses them after `finalize` marks the game solved).
+    apply_locks(&mut game, &spot.locks)?;
     Ok((game, memory))
+}
+
+/// One failed step of a history replay: `history[depth]` asked for `index` where the node
+/// offers `available` (for a chance node, "offers" means dealable cards).
+pub(crate) struct WalkStep {
+    pub depth: usize,
+    pub index: usize,
+    pub available: usize,
+    pub is_chance: bool,
+}
+
+/// Replays `history` from the root, validating every step the way the `node` command does:
+/// at a chance node the index is the dealt card's id and must be dealable; at a player node it
+/// must be within `available_actions`. On success the game is positioned at the node.
+pub(crate) fn walk(game: &mut PostFlopGame, history: &[usize]) -> Result<(), WalkStep> {
+    game.back_to_root();
+    for (depth, &index) in history.iter().enumerate() {
+        if game.is_terminal_node() {
+            return Err(WalkStep {
+                depth,
+                index,
+                available: 0,
+                is_chance: false,
+            });
+        }
+        if game.is_chance_node() {
+            let mask = game.possible_cards();
+            if index >= 52 || mask & (1u64 << index) == 0 {
+                return Err(WalkStep {
+                    depth,
+                    index,
+                    available: mask.count_ones() as usize,
+                    is_chance: true,
+                });
+            }
+        } else {
+            let available = game.available_actions().len();
+            if index >= available {
+                return Err(WalkStep {
+                    depth,
+                    index,
+                    available,
+                    is_chance: false,
+                });
+            }
+        }
+        game.play(index);
+    }
+    Ok(())
+}
+
+/// Pins each lock's strategy at its node. Runs on a built, allocated, not-yet-solved game.
+///
+/// # Errors
+///
+/// [`EngineError::Lock`] naming the lock and the reason: a history step that does not exist, a
+/// target that is not a decision node, dimensions that do not match the node, or a `hands`
+/// guard that disagrees with the acting player's hand list.
+fn apply_locks(game: &mut PostFlopGame, locks: &[crate::spot::Lock]) -> Result<(), EngineError> {
+    for (index, lock) in locks.iter().enumerate() {
+        let err = |reason: String| EngineError::Lock { index, reason };
+
+        walk(game, &lock.history).map_err(|step| {
+            err(format!(
+                "step {} names {} {}, but that node offers {}",
+                step.depth,
+                if step.is_chance { "card" } else { "action" },
+                step.index,
+                step.available,
+            ))
+        })?;
+
+        if game.is_terminal_node() || game.is_chance_node() {
+            return Err(err(
+                "the node it reaches is not a decision node; only a player's strategy can be \
+                 pinned"
+                    .to_owned(),
+            ));
+        }
+
+        let player = game.current_player();
+        let num_actions = game.available_actions().len();
+        let num_hands = game.private_cards(player).len();
+        if lock.strategy.len() != num_actions || lock.strategy[0].len() != num_hands {
+            return Err(err(format!(
+                "`strategy` is {}x{} where the node needs {num_actions} actions x {num_hands} \
+                 hands",
+                lock.strategy.len(),
+                lock.strategy.first().map_or(0, Vec::len),
+            )));
+        }
+
+        if let Some(hands) = &lock.hands {
+            for (h, expected) in hands.iter().enumerate() {
+                let actual = crate::convert::hole_to_string(game.private_cards(player)[h])
+                    .unwrap_or_else(|_| "??".to_owned());
+                if *expected != actual {
+                    return Err(err(format!(
+                        "`hands[{h}]` is `{expected}` but the acting player's hand there is \
+                         `{actual}`",
+                    )));
+                }
+            }
+        }
+
+        let flat: Vec<f32> = lock.strategy.iter().flatten().copied().collect();
+        game.lock_current_strategy(&flat);
+    }
+
+    if !locks.is_empty() {
+        game.back_to_root();
+    }
+    Ok(())
 }
 
 /// How big this spot's tree would be, without allocating it.
