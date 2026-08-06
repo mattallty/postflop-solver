@@ -51,7 +51,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// its own, and bumping the engine revision for a protocol change would be a lie in the other
 /// direction — a host that keys "can I open this file?" on an exact match would mark a whole
 /// library of saved solves unreadable for a change that never touched the engine.
-pub const ENGINE_REV: &str = "b59ef95395f9cb1aaf961200dd9e423015f586f5";
+pub const ENGINE_REV: &str = "e74a7d110009be69111334b36098721556bb4e95";
 
 /// The version string the engine stamps into every solution it writes.
 ///
@@ -75,10 +75,12 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// the format. Every earlier revision stays on it, so a tree saved before any of those bumps is
 /// still offered rather than greyed out:
 ///
+/// - `b59ef95` — [PR #10](https://github.com/mattallty/postflop-solver/pull/10): load-path
+///   guards (`available_actions`, `allocate_memory`) — refusals, not format changes. The
+///   current head sits on top of it and changes only `add_line`'s duplicate check, a refusal
+///   on input the automatic tree builder never produces.
 /// - `dbece54` — [PR #9](https://github.com/mattallty/postflop-solver/pull/9): the `visit`
-///   isomorphism fix and `free_memory` pointer hygiene. The current head sits on top of it and
-///   adds only load-path guards (`available_actions`, `allocate_memory`) — refusals, not
-///   format changes.
+///   isomorphism fix and `free_memory` pointer hygiene.
 /// - `5e3de32` — [PR #6](https://github.com/mattallty/postflop-solver/pull/6): `visit`
 ///   robustness and its tests.
 /// - `b97e0bd` — [PR #3](https://github.com/mattallty/postflop-solver/pull/3): docs, CI and the
@@ -90,11 +92,12 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 ///
 /// Verified 2026-08-02, for the oldest four: the same spot saved by every pair of builds is
 /// byte-identical, and each opens the others' files with identical node output. Verified
-/// 2026-08-06 for `5e3de32` and `dbece54`, each against the head built on top of it, the same
-/// way: the same solved turn spot, saved twice by each build, produced one identical file all
-/// four times.
+/// 2026-08-06 for `5e3de32`, `dbece54` and `b59ef95`, each against the head built on top of
+/// it, the same way: the same solved turn spot, saved twice by each build, produced one
+/// identical file all four times.
 pub const ENGINE_COMPATIBLE_REVS: &[&str] = &[
     ENGINE_REV,
+    "b59ef95395f9cb1aaf961200dd9e423015f586f5",
     "dbece54786442ebd47bd034031e92d076ea282a4",
     "5e3de32ad2cf848b6a33db4a2a806e5f8dca7f51",
     "b97e0bd464a8297c6476cad63b1ddb792d69bc34",
