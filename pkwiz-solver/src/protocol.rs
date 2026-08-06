@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::MemoryEstimate;
 use crate::jobs::{JobError, JobId, JobStatus, Jobs, NodeView};
-use crate::spot::Spot;
+use crate::spot::{BunchingRef, BunchingSpec, Spot};
 
 /// Bumped when a change to the request or response shape is not backward compatible.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -100,6 +100,15 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// pin move was verified the same way against the head built on top of it (most recently
 /// `d1f740d`, 2026-08-07): the same solved turn spot, saved twice by each build, produced one
 /// identical file all four times.
+///
+/// Since `prepareBunching`, each entry also asserts **bunching-file** layout compatibility,
+/// verified the same way: the same prepared data saved by both builds, byte-identical files.
+/// The bar is lower than it sounds — a bunching file shares the container header but, unlike a
+/// game file, carries *no* inner version string ([`ENGINE_FORMAT`] is written by the game
+/// encoder only), so its compatibility rests solely on `BunchingData`'s bincode field layout,
+/// which no revision on this list has touched. The flip side: a future layout change would
+/// surface as a bincode decode failure or a `check_decoded` refusal on old files, not as a
+/// clean version mismatch.
 pub const ENGINE_COMPATIBLE_REVS: &[&str] = &[
     ENGINE_REV,
     "d1f740dfef713f1883b4b601b26c513502b98966",
@@ -152,12 +161,40 @@ pub enum Command {
     #[serde(rename = "forget", rename_all = "camelCase")]
     Forget { job_id: JobId },
     /// Read a solution back as a new, already-finished job.
+    ///
+    /// A game file does **not** record whether it was solved with a bunching effect — the
+    /// engine's format has no field for it — so reopening a bunching solve without the
+    /// `bunching` parameter silently yields non-bunching numbers. Hosts that save bunching
+    /// solves are advised to record the preparation's file path in the memo they save with.
     #[serde(rename = "open", rename_all = "camelCase")]
     Open {
         path: String,
         /// Refuse to load a file whose tree needs more than this. Absent means
         /// [`crate::DEFAULT_MEMORY_LIMIT`] — the same refusal-over-OOM-kill contract the
         /// `solve` command's `maxMemoryBytes` provides.
+        #[serde(default)]
+        max_memory_bytes: Option<u64>,
+        /// Bunching data to re-apply to the loaded game, as `Spot::bunching`: a preparation
+        /// job's id or a `.bunching` file. Remembered on the job, so transparent reloads
+        /// re-apply it too.
+        #[serde(default)]
+        bunching: Option<BunchingRef>,
+    },
+    /// Prepare bunching-effect data as a job of its own: minutes of computation, ~62 MB kept,
+    /// reusable by every later `solve` on the same flop via `spot.bunching`.
+    ///
+    /// A separate job rather than a solve option because the result is keyed only by
+    /// (fold ranges, flop) — recomputing it inside each solve of a flop/turn/river session
+    /// would repeat minutes of identical work. Progress streams as `job` events like a solve's,
+    /// with the 300 preparation steps in `bunching.overallPercent`.
+    #[serde(rename = "prepareBunching", rename_all = "camelCase")]
+    PrepareBunching { bunching: Box<BunchingSpec> },
+    /// Read prepared bunching data back as a new, already-`done` job — `open`'s twin for
+    /// `.bunching` files, referencable from a solve as `{"jobId":…}`.
+    #[serde(rename = "openBunching", rename_all = "camelCase")]
+    OpenBunching {
+        path: String,
+        /// Refuse a file claiming more than this. Absent means [`crate::DEFAULT_MEMORY_LIMIT`].
         #[serde(default)]
         max_memory_bytes: Option<u64>,
     },
@@ -246,7 +283,13 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
         Command::Open {
             path,
             max_memory_bytes,
-        } => json(&jobs.open(&path, max_memory_bytes)?)?,
+            bunching,
+        } => json(&jobs.open(&path, max_memory_bytes, bunching)?)?,
+        Command::PrepareBunching { bunching } => json(&jobs.submit_bunching(*bunching)?)?,
+        Command::OpenBunching {
+            path,
+            max_memory_bytes,
+        } => json(&jobs.open_bunching(&path, max_memory_bytes)?)?,
         Command::Ping => serde_json::json!({ "pong": true }),
         Command::Version | Command::Shutdown => json(&version())?,
     };

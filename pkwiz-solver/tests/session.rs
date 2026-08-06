@@ -171,6 +171,10 @@ fn version_reports_the_engine_it_was_built_against() {
         v["result"]["protocolVersion"],
         pkwiz_solver::PROTOCOL_VERSION
     );
+    // Pinned to the literal: bunching arrived as additive changes only — new commands, new
+    // optional fields — so the protocol version must not have moved, and neither must the
+    // engine pin (the whole feature is sidecar-side; `tests/engine_rev.rs` enforces the rest).
+    assert_eq!(v["result"]["protocolVersion"], 1);
     // A saved solution is only readable by an engine that writes the same format, so the pin is
     // part of the handshake and not a decoration.
     assert_eq!(v["result"]["engineRev"], pkwiz_solver::protocol::ENGINE_REV);
@@ -402,6 +406,80 @@ fn the_executor_is_reachable_without_a_session() {
     assert!(matches!(err, OpError::Job(_)));
     assert_eq!(err.code(), "no_such_job");
 }
+
+#[test]
+fn a_prep_and_its_solve_pipeline_in_one_breath() {
+    // The FIFO promise a host leans on: submit the preparation and the solve that uses it
+    // back-to-back, without reading anything in between, and the preparation is guaranteed to
+    // have finished before the solve builds. In a fresh session the first job id is 1, which is
+    // what lets the second line be written blind.
+    let (session, collector) = session();
+
+    let prep = call(
+        &session,
+        r#"{"id":1,"cmd":"prepareBunching","bunching":{"foldRanges":["AA"],"flop":"2c7dTh"}}"#,
+    );
+    assert_eq!(prep["ok"], true, "{prep}");
+    assert_eq!(prep["result"]["jobId"], 1);
+    assert_eq!(prep["result"]["kind"], "bunching");
+    assert_eq!(prep["result"]["phase"], "queued");
+    assert_eq!(prep["result"]["bunching"]["foldPlayers"], 1);
+
+    let solve = call(
+        &session,
+        &format!(r#"{{"id":2,"cmd":"solve","spot":{SPOT_WITH_BUNCHING}}}"#),
+    );
+    assert_eq!(solve["ok"], true, "{solve}");
+    assert_eq!(solve["result"]["kind"], "solve");
+    let solve_id = solve["result"]["jobId"].as_u64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let v = call(
+            &session,
+            &format!(r#"{{"cmd":"progress","jobId":{solve_id}}}"#),
+        );
+        if v["result"]["phase"] == "done" {
+            break;
+        }
+        assert!(
+            v["result"]["phase"] != "failed",
+            "the solve failed: {}",
+            v["result"]["error"]
+        );
+        assert!(Instant::now() < deadline, "never finished: {v}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Every job frame says what kind of job it is, and events stay distinguishable from
+    // responses by the `event` key alone.
+    let events = collector.events();
+    for event in &events {
+        assert_eq!(event["event"], "job");
+        assert!(event.get("id").is_none() && event.get("ok").is_none());
+        assert!(
+            event["job"]["kind"] == "bunching" || event["job"]["kind"] == "solve",
+            "a frame without a kind: {event}"
+        );
+    }
+    // FIFO in the frames themselves: the preparation's terminal frame precedes the solve's
+    // first building frame.
+    let prep_done = events
+        .iter()
+        .position(|e| e["job"]["jobId"] == 1 && e["job"]["phase"] == "done")
+        .expect("the preparation finished");
+    let solve_building = events
+        .iter()
+        .position(|e| e["job"]["jobId"] == solve_id && e["job"]["phase"] == "building")
+        .expect("the solve built");
+    assert!(
+        prep_done < solve_building,
+        "{prep_done} vs {solve_building}"
+    );
+}
+
+/// The bunching pipeline's solve half: same flop as the preparation above, referencing job 1.
+const SPOT_WITH_BUNCHING: &str = r#"{"oop":"KK","ip":"AA,JJ","board":"2c7dTh4sQd","pot":100,"effectiveStack":100,"stop":{"maxIterations":20,"checkInterval":5},"bunching":{"jobId":1}}"#;
 
 #[test]
 fn a_line_that_is_not_utf8_is_a_bad_request_not_the_end_of_the_session() {

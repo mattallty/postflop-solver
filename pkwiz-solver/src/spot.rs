@@ -271,6 +271,104 @@ fn default_compression_level() -> Option<i32> {
     Spot::default_compression_level()
 }
 
+/// Everything needed to prepare bunching-effect data: who folded, and on what flop.
+///
+/// The result is keyed by exactly these two things, which is why it is a job of its own rather
+/// than a field the solve recomputes: preparing takes seconds to minutes and the answer is valid
+/// for **every** solve on that flop — turn and river included, because only the first three board
+/// cards have to match.
+///
+/// Each fold range must be suit-symmetric (class notation like `"A9o-A2o,K4s:0.73"` qualifies; a
+/// suit-specific combo list like `"AhKd"` does not) — the engine refuses anything else, because
+/// its tables are built on suit isomorphism. At most four fold players.
+///
+/// Solves that use the prepared data are markedly slower: terminal evaluation goes from
+/// O(#OOP + #IP) to O(#OOP × #IP) private hands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BunchingSpec {
+    /// One range per folded player, 1–4 of them, each suit-symmetric.
+    pub fold_ranges: Vec<RangeSpec>,
+    /// Exactly three cards. Solves referencing this preparation must share them (sorted).
+    pub flop: BoardSpec,
+    /// Caps the preparation's **peak** memory, temporary tables included; the four-fold-player
+    /// case peaks at ~3.7 GB. Absent means [`crate::DEFAULT_MEMORY_LIMIT`].
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    /// Where to write the prepared data when it finishes. Absent means keep it in memory only.
+    #[serde(default)]
+    pub save_path: Option<String>,
+    /// zstd level for the file, as [`Spot::compression_level`].
+    #[serde(default = "default_compression_level")]
+    pub compression_level: Option<i32>,
+    /// Free-text note stored alongside the saved data — which seats folded, typically.
+    #[serde(default)]
+    pub memo: Option<String>,
+}
+
+impl BunchingSpec {
+    /// Parse the flop and the ranges, and let the engine judge the rest.
+    ///
+    /// The engine is the sole authority on suit-symmetry, emptiness and the fold-player cap —
+    /// its checks are private, so they are not duplicated here; its message comes back verbatim
+    /// inside [`SpotError::Bunching`]. The returned data is *unprocessed*: cheap to build, cheap
+    /// to throw away, which is why both the submit path and the worker can afford to call this.
+    ///
+    /// # Errors
+    ///
+    /// If the flop is not exactly three cards, a range does not parse, or the engine refuses the
+    /// configuration.
+    pub fn validate(&self) -> Result<postflop_solver::BunchingData, SpotError> {
+        let cards = self.flop.cards()?;
+        if cards.len() != 3 {
+            return Err(SpotError::Board {
+                board: match &self.flop {
+                    BoardSpec::Text(s) => s.clone(),
+                    BoardSpec::Cards(v) => v.join(""),
+                },
+                reason: format!(
+                    "a bunching flop is exactly three cards; got {}",
+                    cards.len()
+                ),
+            });
+        }
+
+        let mut ranges = Vec::with_capacity(self.fold_ranges.len());
+        for spec in &self.fold_ranges {
+            let ours = spec.resolve()?;
+            ranges.push(
+                crate::convert::to_engine_range(&ours)
+                    .map_err(|reason| SpotError::Bunching { reason })?,
+            );
+        }
+
+        let flop = [
+            crate::convert::to_engine_card(cards[0]),
+            crate::convert::to_engine_card(cards[1]),
+            crate::convert::to_engine_card(cards[2]),
+        ];
+        postflop_solver::BunchingData::new(&ranges, flop)
+            .map_err(|reason| SpotError::Bunching { reason })
+    }
+}
+
+/// How a solve names the bunching data it wants applied.
+///
+/// Untagged: the two wire shapes are told apart by their field name — `{"jobId":7}` names a
+/// `prepareBunching`/`openBunching` job in this session, `{"path":"/x.bunching"}` a file loaded
+/// when the solve starts. A typo'd field name matches neither variant and surfaces as serde's
+/// generic untagged error inside `bad_request` — the same trade [`RangeSpec`] and [`BoardSpec`]
+/// already accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BunchingRef {
+    /// A preparation job in this session.
+    #[serde(rename_all = "camelCase")]
+    Job { job_id: crate::jobs::JobId },
+    /// A `.bunching` file on disk.
+    File { path: String },
+}
+
 /// Everything needed to solve one spot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -333,6 +431,17 @@ pub struct Spot {
     /// Empty means none. See [`Lock`] for the layout contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locks: Vec<Lock>,
+    /// Bunching-effect data to apply before solving. Absent means none, which is every solve
+    /// that existed before this field did.
+    ///
+    /// Only the first three board cards, sorted, must match the preparation's flop — the
+    /// engine's own rule, which is what lets one preparation serve the flop, turn and river of
+    /// the same hand. Expect the solve to be several times slower: terminal evaluation becomes
+    /// O(#OOP × #IP). A `savePath` file written by a bunching solve does **not** carry the
+    /// effect (the engine's format has no field for it), so keep the preparation job or its
+    /// file around for reopening.
+    #[serde(default)]
+    pub bunching: Option<BunchingRef>,
 }
 
 /// Pin (part of) the acting player's strategy at one node before the solve.
@@ -396,6 +505,7 @@ impl Spot {
             added_lines: Vec::new(),
             removed_lines: Vec::new(),
             locks: Vec::new(),
+            bunching: None,
         }
     }
 
@@ -666,6 +776,8 @@ pub enum SpotError {
     },
     #[error("these edits leave the node after `{line}` with no actions")]
     EmptyNode { line: String },
+    #[error("the bunching configuration is invalid: {reason}")]
+    Bunching { reason: String },
 }
 
 #[cfg(test)]
@@ -816,5 +928,65 @@ mod tests {
     fn empty_sizing_is_a_check_through_tree_not_an_error() {
         let options = StreetSizing::none().options("river").unwrap();
         assert!(options.bet.is_empty() && options.raise.is_empty());
+    }
+
+    #[test]
+    fn a_bunching_flop_is_exactly_three_cards() {
+        let spec: BunchingSpec =
+            serde_json::from_str(r#"{"foldRanges":["AA"],"flop":"Td9d6hQc"}"#).unwrap();
+        // `unwrap_err` needs `Debug` on the success type, which the engine's data lacks.
+        let Err(err) = spec.validate() else {
+            panic!("a four-card flop validated");
+        };
+        assert!(err.to_string().contains("exactly three cards"), "{err}");
+    }
+
+    #[test]
+    fn a_bunching_spec_fills_its_defaults_like_a_spot_does() {
+        let spec: BunchingSpec =
+            serde_json::from_str(r#"{"foldRanges":["AA"],"flop":"Td9d6h"}"#).unwrap();
+        assert_eq!(spec.compression_level, Some(3));
+        assert_eq!(spec.save_path, None);
+        assert_eq!(spec.max_memory_bytes, None);
+        assert_eq!(spec.memo, None);
+        // And the minimal spec validates: the engine accepts one suit-symmetric fold range.
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn a_bunching_ref_is_told_apart_by_its_field_name() {
+        let job: BunchingRef = serde_json::from_str(r#"{"jobId":7}"#).unwrap();
+        assert_eq!(job, BunchingRef::Job { job_id: 7 });
+        let file: BunchingRef = serde_json::from_str(r#"{"path":"/x.bunching"}"#).unwrap();
+        assert_eq!(
+            file,
+            BunchingRef::File {
+                path: "/x.bunching".to_owned()
+            }
+        );
+        // Round-trip: what a host reads back is what it sent.
+        for r in [job, file] {
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<BunchingRef>(&json).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn a_spot_without_bunching_still_parses_old_wire_json_verbatim() {
+        // The PROTOCOL_VERSION 1 guard: every solve request that worked before this field
+        // existed must keep working, and must mean "no bunching".
+        let spot: Spot = serde_json::from_str(
+            r#"{"oop":"QQ+","ip":"QQ+","board":"Td9d6h","pot":100,"effectiveStack":500}"#,
+        )
+        .unwrap();
+        assert_eq!(spot.bunching, None);
+        assert!(spot.validate().is_ok());
+
+        let with_ref: Spot = serde_json::from_str(
+            r#"{"oop":"QQ+","ip":"QQ+","board":"Td9d6h","pot":100,"effectiveStack":500,
+                "bunching":{"jobId":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(with_ref.bunching, Some(BunchingRef::Job { job_id: 3 }));
     }
 }
