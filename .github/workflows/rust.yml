@@ -35,16 +35,22 @@ jobs:
         key: build
     - name: Build
       run: |
-        cargo build --release --features zstd
-        cargo +nightly build --release --features custom-alloc
-        cargo run --release --example basic
-        cargo run --release --example file_io
-        cargo run --release --example node_locking
-        cargo run --release --example from_config
+        cargo build --release --locked --features zstd
+        cargo +nightly build --release --locked --features custom-alloc
+        cargo run --release --locked --example basic
+        cargo run --release --locked --example file_io
+        cargo run --release --locked --example node_locking
+        cargo run --release --locked --example from_config
+    # No `rayon`, no `bincode`: the single-threaded solver path and the bincode-less build
+    # exist and are advertised, but nothing else in CI ever compiles them, so they can only
+    # rot silently. A check is enough — the full test suite needs `bincode` for its file
+    # round-trips.
+    - name: Check without default features
+      run: cargo check --release --locked --no-default-features
     - name: Run tests
       run: |
-        cargo test --release --features zstd
-        cargo +nightly test --release --features custom-alloc -- --test-threads 1
+        cargo test --release --locked --features zstd
+        cargo +nightly test --release --locked --features custom-alloc -- --test-threads 1
     - name: Clippy
       run: |
         cargo clippy --release --features zstd -- -A clippy::needless_range_loop
@@ -69,15 +75,31 @@ jobs:
         key: msrv
     - name: Build with MSRV
       run: |
-        cargo +1.97 build --release --features zstd
-        cargo +1.97 test --release --features zstd
+        cargo +1.97 build --release --locked --features zstd
+        cargo +1.97 test --release --locked --features zstd
 
   # The `build` job above runs at the repository root, which is the engine's own package — a root
   # package that is also a workspace root keeps `cargo build`/`test`/`clippy` there targeting the
   # engine alone. The sidecar therefore needs asking for by name, or it would go untested.
   sidecar:
-    name: sidecar
-    runs-on: ubuntu-latest
+    name: sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu pins the MSRV, so the sidecar cannot quietly outgrow the declared minimum.
+          - os: ubuntu-latest
+            toolchain: '1.97'
+          # Windows and macOS track `stable` — the toolchain the release pipeline actually
+          # ships — so the platforms we publish for run the whole suite, not only `--version`.
+          # Path handling in save/open and `\r\n` framing are exactly the kinds of bug a
+          # Linux-only suite cannot catch, and until now every released Windows and macOS
+          # binary had passed nothing but the smoke check.
+          - os: windows-latest
+            toolchain: stable
+          - os: macos-latest
+            toolchain: stable
     steps:
     - uses: actions/checkout@v7
       with:
@@ -86,21 +108,23 @@ jobs:
         # without this the check would quietly become a no-op here — which is the failure mode it
         # exists to prevent.
         fetch-depth: 0
-    - name: Install MSRV toolchain
-      run: rustup toolchain install 1.97 --profile minimal --component clippy
+    - name: Install the ${{ matrix.toolchain }} toolchain
+      run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy
     - uses: Swatinem/rust-cache@v2
       with:
-        key: sidecar
+        key: sidecar-${{ matrix.os }}
     - name: Build and test
       run: |
-        cargo +1.97 build --release -p pkwiz-solver
-        cargo +1.97 test --release -p pkwiz-solver
+        cargo +${{ matrix.toolchain }} build --release --locked -p pkwiz-solver
+        cargo +${{ matrix.toolchain }} test --release --locked -p pkwiz-solver
     # `-A needless_range_loop` for the same reason the engine's own clippy step carries it: the
     # engine is a workspace member now, so linting the sidecar lints it too, and its indexed loops
     # are deliberate.
     - name: Clippy
-      run: cargo +1.97 clippy --release -p pkwiz-solver --all-targets -- -D warnings -A clippy::needless_range_loop
+      run: cargo +${{ matrix.toolchain }} clippy --release --locked -p pkwiz-solver --all-targets -- -D warnings -A clippy::needless_range_loop
     # The release artifacts are what an application downloads, and it probes them with exactly
-    # this before trusting one. Failing here beats failing on a user's machine.
+    # this before trusting one. Failing here beats failing on a user's machine. Bash on every
+    # platform: Git Bash resolves the `.exe` on Windows, so one line covers all three.
     - name: It answers --version
       run: ./target/release/pkwiz-solver --version
+      shell: bash
