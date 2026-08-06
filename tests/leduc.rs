@@ -440,7 +440,11 @@ impl GameNode for LeducNode {
 fn leduc() {
     let target = 1e-4;
     let mut game = LeducGame::new(false);
-    solve(&mut game, 10000, target, false);
+    let exploitability = solve(&mut game, 10000, target, false);
+    assert!(
+        exploitability <= target,
+        "did not converge: {exploitability} > {target}"
+    );
 
     let root = game.root();
 
@@ -466,7 +470,11 @@ fn leduc() {
 fn leduc_compressed() {
     let target = 1e-3;
     let mut game = LeducGame::new(true);
-    solve(&mut game, 10000, target, false);
+    let exploitability = solve(&mut game, 10000, target, false);
+    assert!(
+        exploitability <= target,
+        "did not converge: {exploitability} > {target}"
+    );
 
     let root = game.root();
 

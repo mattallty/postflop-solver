@@ -92,6 +92,15 @@ Relative to the last upstream commit:
   (upstream issue #29)
 - **`from_config` example** — solve a game described by a JSON file instead of Rust code.
   (upstream issue #53)
+- **A correctness and robustness pass** (PRs #9–#18): `visit` traverses correctly below
+  isomorphism-eliminated turn cards; `free_memory` nulls node storage pointers and resets the
+  interpreter; loading a file saved with a reduced storage mode can no longer read out of
+  bounds through `available_actions` or be re-allocated over; `add_line` no longer duplicates
+  an existing all-in; **files are validated at the trust boundary** — storage offsets, node
+  counts, children ranges, board cards, and locking strategies are all checked at decode time
+  (pinned by an exhaustive bit-flip test), so a corrupt or crafted file is answered with `Err`
+  rather than undefined behavior; and the range/flop parsers accept any case, reject malformed
+  dash ranges, and never panic on ill-formed input.
 
 The solver algorithm and its numerical behaviour are unchanged; the PioSOLVER-reference
 accuracy tests and the bunching tests still pass.

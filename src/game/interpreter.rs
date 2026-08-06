@@ -81,7 +81,10 @@ impl PostFlopGame {
     /// nodes are visited.
     ///
     /// After this method returns, the current node is restored to whatever it was before the
-    /// call, i.e., calling this method does not change the current node.
+    /// call, i.e., calling this method does not change the current node. The normalized-weight
+    /// cache is **not** restored: the restoration navigates the tree like any other move, so a
+    /// caller that cached weights before the call must call [`cache_normalized_weights`] again
+    /// after it.
     ///
     /// # Reading equities and expected values
     ///
@@ -180,7 +183,12 @@ impl PostFlopGame {
         let actions = self.available_actions();
 
         for (index, action) in actions.iter().enumerate() {
-            self.apply_history(&history);
+            // The game already sits at `history` for the first child — on entry, and because
+            // the visitor's position was restored above. Only the later siblings need the
+            // replay from the root, which is where this traversal's cost lives.
+            if index > 0 {
+                self.apply_history(&history);
+            }
             match (is_chance, action) {
                 // `prev_action` stores the card in storage coordinates, while `play` expects it
                 // in actual coordinates and converts by swapping the suits in
@@ -427,7 +435,9 @@ impl PostFlopGame {
     ///
     /// Panics if the memory is not yet allocated or the current node is a terminal node.
     ///
-    /// **Time complexity:** *O*(#(OOP private hands) + #(IP private hands))
+    /// **Time complexity:** *O*(#actions × #(private hands)) at a player node — the weight
+    /// update reads the current strategy, which stores that many entries — and *O*(#(OOP
+    /// private hands) + #(IP private hands)) at a chance node
     ///
     /// [`available_actions`]: #method.available_actions
     pub fn play(&mut self, action: usize) {

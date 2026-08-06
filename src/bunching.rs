@@ -146,7 +146,9 @@ pub struct BunchingData {
 fn mask_to_index(mut mask: u64, k: usize) -> usize {
     let mut index = 0;
     for i in 0..k {
-        assert!(mask != 0);
+        // Internal invariant (the mask always carries at least `k` bits); a hard assert here
+        // sits on the terminal-evaluation hot path of every bunching solve.
+        debug_assert!(mask != 0);
         let tz = mask.trailing_zeros();
         index += COMB_TABLE[i][tz as usize];
         mask &= mask - 1;
@@ -174,7 +176,9 @@ fn next_combination(mask: u64) -> u64 {
 
 #[inline]
 fn compress_mask(mut mask: u64, flop: [Card; 3]) -> u64 {
-    assert!(flop[0] < flop[1] && flop[1] < flop[2]);
+    // Internal invariant: the constructor sorts the flop and the file validation re-checks it,
+    // and this sits on the terminal-evaluation hot path of every bunching solve.
+    debug_assert!(flop[0] < flop[1] && flop[1] < flop[2]);
     for i in 0..3 {
         let m = (1 << (flop[i] as usize - i)) - 1;
         mask = (mask & m) | ((mask >> 1) & !m);

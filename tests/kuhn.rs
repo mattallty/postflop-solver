@@ -245,7 +245,11 @@ impl GameNode for KuhnNode {
 fn kuhn() {
     let target = 1e-4;
     let mut game = KuhnGame::new();
-    solve(&mut game, 10000, target, false);
+    let exploitability = solve(&mut game, 10000, target, false);
+    assert!(
+        exploitability <= target,
+        "did not converge: {exploitability} > {target}"
+    );
 
     let root = game.root();
 
