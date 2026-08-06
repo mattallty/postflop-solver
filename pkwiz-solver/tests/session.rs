@@ -400,3 +400,86 @@ fn the_executor_is_reachable_without_a_session() {
     assert!(matches!(err, OpError::Job(_)));
     assert_eq!(err.code(), "no_such_job");
 }
+
+#[test]
+fn a_line_that_is_not_utf8_is_a_bad_request_not_the_end_of_the_session() {
+    // `BufRead::lines` would answer one stray byte with `InvalidData`, ending the loop — and
+    // with it the queue and every in-memory tree. The contract says a command can fail and a
+    // session cannot, so the corrupt line gets a response and the next line gets served.
+    let (session, collector) = session();
+
+    let mut input: Vec<u8> = Vec::new();
+    input.extend_from_slice(b"\xff\xfe{\"cmd\":\"ping\"}\n");
+    input.extend_from_slice(b"{\"id\":7,\"cmd\":\"ping\"}\n");
+    session
+        .run(std::io::BufReader::new(input.as_slice()))
+        .expect("a corrupt line is not an I/O error");
+
+    let frames = collector.frames();
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[0]["ok"], false);
+    assert_eq!(frames[0]["error"]["code"], "bad_request");
+    assert_eq!(
+        frames[1]["ok"], true,
+        "the session kept serving: {frames:?}"
+    );
+    assert_eq!(frames[1]["id"], 7);
+}
+
+#[test]
+fn an_oversized_line_is_discarded_not_buffered_without_bound() {
+    // A host that never sends its newline must not grow this process's line buffer forever;
+    // past the cap the line is swallowed in bounded chunks and answered like any bad request.
+    let (session, collector) = session();
+
+    let mut input = vec![b'x'; pkwiz_solver::MAX_LINE_BYTES + 4096];
+    input.push(b'\n');
+    input.extend_from_slice(b"{\"id\":8,\"cmd\":\"ping\"}\n");
+    session
+        .run(std::io::BufReader::new(input.as_slice()))
+        .expect("an oversized line is not an I/O error");
+
+    let frames = collector.frames();
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[0]["ok"], false);
+    assert_eq!(frames[0]["error"]["code"], "bad_request");
+    assert_eq!(frames[1]["ok"], true);
+    assert_eq!(frames[1]["id"], 8);
+}
+
+#[test]
+fn forget_over_the_wire_removes_the_job() {
+    let (session, _) = session();
+    let queued = call(
+        &session,
+        &format!(r#"{{"id":1,"cmd":"solve","spot":{SPOT}}}"#),
+    );
+    let id = queued["result"]["jobId"].as_u64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let v = call(
+            &session,
+            &format!(r#"{{"id":2,"cmd":"progress","jobId":{id}}}"#),
+        );
+        if v["result"]["phase"] == "done" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "job never finished: {v}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let forgotten = call(
+        &session,
+        &format!(r#"{{"id":3,"cmd":"forget","jobId":{id}}}"#),
+    );
+    assert_eq!(forgotten["ok"], true, "{forgotten}");
+    assert_eq!(forgotten["result"]["phase"], "done");
+
+    let after = call(
+        &session,
+        &format!(r#"{{"id":4,"cmd":"progress","jobId":{id}}}"#),
+    );
+    assert_eq!(after["ok"], false);
+    assert_eq!(after["error"]["code"], "no_such_job");
+}

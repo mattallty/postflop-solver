@@ -125,9 +125,21 @@ pub enum Command {
     /// Hand back the memory a finished job's tree is holding, keeping the row.
     #[serde(rename = "release", rename_all = "camelCase")]
     Release { job_id: JobId },
+    /// Remove a finished job entirely — its tree and its row. The deliberate-discard
+    /// counterpart to `release`, and the only way to free a tree that was never saved.
+    /// Responds with the removed job's final status; afterwards the id answers `no_such_job`.
+    #[serde(rename = "forget", rename_all = "camelCase")]
+    Forget { job_id: JobId },
     /// Read a solution back as a new, already-finished job.
     #[serde(rename = "open", rename_all = "camelCase")]
-    Open { path: String },
+    Open {
+        path: String,
+        /// Refuse to load a file whose tree needs more than this. Absent means
+        /// [`crate::DEFAULT_MEMORY_LIMIT`] — the same refusal-over-OOM-kill contract the
+        /// `solve` command's `maxMemoryBytes` provides.
+        #[serde(default)]
+        max_memory_bytes: Option<u64>,
+    },
     /// Liveness check.
     #[serde(rename = "ping")]
     Ping,
@@ -204,7 +216,11 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
         }
         Command::Save { job_id, path } => json(&jobs.save(job_id, &path)?)?,
         Command::Release { job_id } => json(&jobs.release(job_id)?)?,
-        Command::Open { path } => json(&jobs.open(&path)?)?,
+        Command::Forget { job_id } => json(&jobs.forget(job_id)?)?,
+        Command::Open {
+            path,
+            max_memory_bytes,
+        } => json(&jobs.open(&path, max_memory_bytes)?)?,
         Command::Ping => serde_json::json!({ "pong": true }),
         Command::Version | Command::Shutdown => json(&version())?,
     };

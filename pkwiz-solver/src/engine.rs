@@ -309,13 +309,22 @@ pub fn save(
     })
 }
 
-/// Read a solved game back.
+/// Read a solved game back, refusing one that needs more memory than the cap allows.
+///
+/// `max_memory_bytes` of `None` means [`DEFAULT_MEMORY_LIMIT`]. An uncapped load would be the
+/// one path on which an oversized — or corrupt-header — file gets this process OOM-killed, the
+/// exact fate the solve path's `TooBig` refusal exists to prevent.
 ///
 /// # Errors
 ///
-/// If the file is missing, is not a solution, or was written by an incompatible engine build.
-pub fn load(path: &str) -> Result<(PostFlopGame, String), EngineError> {
-    postflop_solver::load_data_from_file(path, None).map_err(|reason| EngineError::Load {
+/// If the file is missing, is not a solution, was written by an incompatible engine build, or
+/// needs more memory than the cap allows.
+pub fn load(
+    path: &str,
+    max_memory_bytes: Option<u64>,
+) -> Result<(PostFlopGame, String), EngineError> {
+    let limit = max_memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
+    postflop_solver::load_data_from_file(path, Some(limit)).map_err(|reason| EngineError::Load {
         path: path.to_owned(),
         reason,
     })

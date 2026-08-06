@@ -26,7 +26,9 @@
 //! game can be dropped and reloaded on demand. Starting a solve *or opening a file* releases every
 //! other recoverable game first, which bounds resident trees to the one being acquired plus those
 //! that were never saved. `node` reloads transparently, so nothing above this module can tell the
-//! difference — only [`JobStatus::resident`] reveals it, for a host that wants to show it.
+//! difference — only [`JobStatus::resident`] reveals it, for a host that wants to show it. A tree
+//! that was never saved can still be freed, by [`Jobs::forget`]: the host declares it is done with
+//! the answer, and the row goes with the tree.
 //!
 //! Both moments matter, and only one of them is obvious. A solution browser walking a library calls
 //! `open` and never `solve`, so sweeping on `solve` alone would leave the commonest path — and
@@ -204,8 +206,10 @@ pub enum JobError {
     NotReadable { id: JobId, phase: Phase },
     #[error("job {0} has no solution to save")]
     NothingToSave(JobId),
-    #[error("job {0} has not been saved to a file, so releasing its tree would discard it; save it first")]
+    #[error("job {0} has not been saved to a file, so releasing its tree would discard it; save it first, or use `forget` to discard it deliberately")]
     NotRecoverable(JobId),
+    #[error("job {id} is {phase:?}; it can only be forgotten once it is finished, cancelled, or failed — cancel it first")]
+    NotFinished { id: JobId, phase: Phase },
     #[error("{0}")]
     Engine(#[from] EngineError),
     #[error("action index {index} is out of range at that node, which offers {available}")]
@@ -223,6 +227,7 @@ impl JobError {
             Self::NotReadable { .. } => "not_readable",
             Self::NothingToSave(_) => "nothing_to_save",
             Self::NotRecoverable(_) => "not_recoverable",
+            Self::NotFinished { .. } => "not_finished",
             Self::Engine(_) => "engine",
             Self::BadHistory { .. } | Self::NoStrategy { .. } => "bad_node",
         }
@@ -391,16 +396,60 @@ impl Jobs {
         Ok(status)
     }
 
+    /// Remove a finished job entirely, dropping its tree and its row.
+    ///
+    /// This is the deliberate-discard counterpart to [`Jobs::release`]: `release` refuses a job
+    /// that was never saved, because reading it again would have nothing to reload from — which
+    /// left a session that solves without `savePath` pinning every tree it ever produced until
+    /// the process exited. `forget` is the escape hatch: the host says it is done with the
+    /// answer, saved or not, and both the tree and the row go. The id is never reused;
+    /// afterwards the job answers `no_such_job`.
+    ///
+    /// No frame is pushed: the job's terminal frame was already emitted, and a row that no
+    /// longer exists has no status to report. The removed job's final status is returned as the
+    /// response instead.
+    ///
+    /// # Errors
+    ///
+    /// If the id is unknown, or the job is not yet terminal — cancel it first, so the worker is
+    /// never left solving into a row that no longer exists.
+    pub fn forget(&self, id: JobId) -> Result<JobStatus, JobError> {
+        let mut jobs = self.shared.jobs.lock().unwrap();
+        let job = jobs.get(&id).cloned().ok_or(JobError::NoSuchJob(id))?;
+        // Only terminal jobs are removed, and a terminal phase never regresses, so the worker —
+        // whose claim requires `Queued` — can never take a job that passed this check. A job
+        // cancelled while queued may still have its id in the queue; the worker handles that by
+        // looking the id up again and finding nothing.
+        let status = job.status.lock().unwrap().clone();
+        if !status.phase.is_terminal() {
+            return Err(JobError::NotFinished {
+                id,
+                phase: status.phase,
+            });
+        }
+        jobs.remove(&id);
+        drop(jobs);
+        // The `job` Arc dropped at the end of this scope is usually the last one, taking the
+        // game — potentially gigabytes — with it, outside every lock.
+        Ok(status)
+    }
+
     /// Read a solution back from disk as a new, already-finished job.
     ///
     /// Reopening is the point of saving: a solution browser lists files and hands
     /// each one back to the same `node` command the live solve uses, so nothing downstream has to
     /// know whether a strategy was just computed or loaded.
     ///
+    /// `max_memory_bytes` caps what the load may allocate; `None` means
+    /// [`crate::DEFAULT_MEMORY_LIMIT`]. The solve path goes to great lengths to answer `tooBig`
+    /// instead of being OOM-killed, and a browser opening an oversized (or corrupt-header) file
+    /// deserves the same refusal. The cap is remembered on the job, so a later transparent
+    /// reload obeys it too.
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read or is not a solution.
-    pub fn open(&self, path: &str) -> Result<JobStatus, JobError> {
+    /// If the file cannot be read, is not a solution, or needs more memory than the cap allows.
+    pub fn open(&self, path: &str, max_memory_bytes: Option<u64>) -> Result<JobStatus, JobError> {
         // Opening is the other moment the process is about to hold a whole tree — a solution
         // browser walking a library calls this and never `solve`, so without this the sweep would
         // never run on the commonest path and each file opened, including the same file twice,
@@ -409,7 +458,7 @@ impl Jobs {
         // before asking for more; a load that then fails has cost only some lazy reloading.
         release_others(&self.shared, None);
 
-        let (game, memo) = engine::load(path)?;
+        let (game, memo) = engine::load(path, max_memory_bytes)?;
 
         let tree = game.tree_config();
         let spot = Spot {
@@ -431,7 +480,7 @@ impl Jobs {
             },
             stop: crate::spot::Stop::default(),
             compress: false,
-            max_memory_bytes: None,
+            max_memory_bytes,
             save_path: None,
             compression_level: crate::spot::Spot::default_compression_level(),
             memo: Some(memo),
@@ -484,12 +533,17 @@ impl Jobs {
 
         let mut guard = job.game.lock().unwrap();
         if guard.is_none() {
-            // Released, or never published. Only the first is recoverable.
+            // Released, or never published. Only the first is recoverable. The reload honours
+            // the same memory cap the job was allowed when it was built or opened.
             let path = saved_to.ok_or(JobError::NotReadable { id, phase })?;
-            *guard = Some(engine::load(&path)?.0);
-            drop(guard);
+            *guard = Some(engine::load(&path, job.spot.max_memory_bytes)?.0);
+            // The status is updated while the game guard is still held: dropping it first
+            // would let `release_others` (from a concurrent `open`, or a solve starting) take
+            // the freshly loaded game in the gap, leaving `resident: true` with no game and
+            // turning this read into a bogus error. No deadlock: this game → status nesting is
+            // the one ordering the module uses, and no path acquires the game lock while
+            // holding a status lock.
             job.status.lock().unwrap().resident = true;
-            guard = job.game.lock().unwrap();
         }
         let game = guard.as_mut().ok_or(JobError::NotReadable { id, phase })?;
         node_view(game, history)
@@ -538,8 +592,9 @@ impl Shared {
 
 /// Drop one job's game and say so. Assumes the caller has established that it is recoverable.
 ///
-/// Neither lock is held across the other: `save` takes the game lock and then the status lock, and
-/// doing the same here keeps the one ordering this module uses.
+/// The game guard is released before the status lock is taken. Only `node`'s reload path nests
+/// the two, in game → status order; nothing nests them the other way, which is what keeps the
+/// module deadlock-free.
 fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
     let dropped = job.game.lock().unwrap().take();
     if dropped.is_none() {
@@ -605,10 +660,6 @@ fn work(shared: &Arc<Shared>) {
         let Some(job) = shared.jobs.lock().unwrap().get(&next).cloned() else {
             continue;
         };
-        if job.cancel.load(Ordering::Relaxed) {
-            // Cancelled before it ever started; `cancel` already set the phase and emitted.
-            continue;
-        }
 
         run_job(shared, &job);
     }
@@ -616,7 +667,28 @@ fn work(shared: &Arc<Shared>) {
 
 fn run_job(shared: &Arc<Shared>, job: &Arc<Job>) {
     let started = Instant::now();
-    set_phase(shared, job, Phase::Building, started);
+
+    // Claim the job: the cancel check and the Queued → Building transition happen inside one
+    // critical section on the status lock. `cancel` marks a job terminal only while it is still
+    // `Queued`, under the same lock — so either it wins and the worker sees a non-Queued phase
+    // here and walks away, or the claim wins and `cancel` degrades to the set-the-flag path. A
+    // bare flag check before the transition had a window in which a job could be marked
+    // `Cancelled` (a terminal frame, emitted) and then hauled back to `Building` by the worker,
+    // which both violates "terminal frames are final" and burns a full tree build.
+    {
+        let mut status = job.status.lock().unwrap();
+        if job.cancel.load(Ordering::Relaxed) || status.phase != Phase::Queued {
+            // Cancelled before it ever started; `cancel` already set the phase and emitted.
+            return;
+        }
+        status.phase = Phase::Building;
+        status.elapsed_ms = 0;
+        let snapshot = status.clone();
+        // Dropped before emitting: this frame is not terminal, and a `progress` query must not
+        // have to wait behind a pipe write to be answered.
+        drop(status);
+        shared.emit_status(&snapshot);
+    }
 
     // Before allocating: hand back every tree that is already on disk. This is the difference
     // between an afternoon of solves costing one tree of memory and costing all of them.
@@ -709,17 +781,6 @@ fn run_job(shared: &Arc<Shared>, job: &Arc<Job>) {
     status.elapsed_ms = started.elapsed().as_millis() as u64;
     // Emitted under the lock — see `Shared::emit_status`.
     shared.emit_status(&status);
-}
-
-fn set_phase(shared: &Arc<Shared>, job: &Arc<Job>, phase: Phase, started: Instant) {
-    let mut status = job.status.lock().unwrap();
-    status.phase = phase;
-    status.elapsed_ms = started.elapsed().as_millis() as u64;
-    let snapshot = status.clone();
-    // Dropped first, unlike the terminal emit: this frame is one of many and a `progress` query
-    // must not have to wait behind a pipe write to be answered.
-    drop(status);
-    shared.emit_status(&snapshot);
 }
 
 fn fail(shared: &Arc<Shared>, job: &Arc<Job>, started: Instant, message: String) {
