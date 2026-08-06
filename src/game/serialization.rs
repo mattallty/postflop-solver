@@ -58,6 +58,185 @@ impl PostFlopGame {
         }
     }
 
+    /// Structural validation of a freshly decoded game, run before anything walks the tree.
+    ///
+    /// The per-node storage offsets are already bounds-checked during decoding (see
+    /// `checked_offset`); what remains is everything whose consistency spans nodes. A file is a
+    /// trust boundary: every check here corresponds to a way a corrupt or crafted file could
+    /// otherwise reach an out-of-bounds read or a panic through safe methods.
+    ///
+    /// Must run after `check_card_config` and `init_card_fields` — the node counts are
+    /// recomputed from the decoded action tree and card config, which is what makes the
+    /// decoded `num_nodes` a claim that can be checked rather than trusted.
+    fn validate_decoded(&mut self) -> Result<(), String> {
+        // `num_nodes` drives `allocate_memory` and the street indexing; recompute it from the
+        // tree the file actually contains.
+        let counted = self.count_num_nodes();
+        if counted != self.num_nodes {
+            return Err(format!(
+                "corrupt file: node counts {:?} do not match the action tree, which yields {:?}",
+                self.num_nodes, counted,
+            ));
+        }
+
+        // The arena must hold exactly the prefix its storage mode claims.
+        let expected_len = match self.storage_mode {
+            BoardState::Flop => counted[0],
+            BoardState::Turn => counted[0] + counted[1],
+            BoardState::River => counted[0] + counted[1] + counted[2],
+        };
+        if self.node_arena.len() as u64 != expected_len {
+            return Err(format!(
+                "corrupt file: node arena holds {} nodes where its storage mode requires {}",
+                self.node_arena.len(),
+                expected_len,
+            ));
+        }
+
+        let arena_len = self.node_arena.len();
+        for index in 0..arena_len {
+            let node = self.node_arena[index].lock();
+
+            // Terminal evaluation and the isomorphism tables index by these cards, and the
+            // per-board tables (`hand_strength`, `valid_indices`) are populated only for
+            // boards the card config can deal. A card pair that is well-formed but impossible
+            // — a turn equal to a flop card, a river the config fixed differently — lands on
+            // an empty table entry, whose sentinel arithmetic underflows in debug and reads
+            // out of bounds through `get_unchecked` in release. So a node's cards must be
+            // exactly what the config allows dealt there.
+            let config = &self.card_config;
+            let flop = config.flop;
+            let turn_ok = if config.turn != NOT_DEALT {
+                node.turn == config.turn
+            } else {
+                node.turn == NOT_DEALT || (node.turn < 52 && !flop.contains(&node.turn))
+            };
+            let river_ok = if config.river != NOT_DEALT {
+                node.river == config.river
+            } else {
+                node.river == NOT_DEALT
+                    || (node.river < 52
+                        && !flop.contains(&node.river)
+                        && node.turn != NOT_DEALT
+                        && node.river != node.turn)
+            };
+            if !turn_ok || !river_ok {
+                return Err(format!(
+                    "corrupt file: node {index} carries board cards {}/{}, which this \
+                     configuration cannot deal",
+                    node.turn, node.river,
+                ));
+            }
+
+            if node.is_terminal() {
+                if node.num_children != 0 || node.num_elements != 0 || node.num_elements_ip != 0 {
+                    return Err(format!(
+                        "corrupt file: terminal node {index} claims children or storage",
+                    ));
+                }
+                continue;
+            }
+
+            // The element counts drive every storage slice the accessors and the finalizer
+            // build, and each has exactly one value the tree structure allows. (The decode-time
+            // bounds checks used the counts from the file; pinning them here makes those
+            // checks checks of the true sizes.)
+            let (expected_elements, expected_elements_ip) = if node.is_chance() {
+                let elements = node
+                    .cfvalue_storage_player()
+                    .map_or(0, |player| self.private_cards[player].len());
+                (elements, 0)
+            } else {
+                if node.player > 1 {
+                    return Err(format!(
+                        "corrupt file: node {index} names player {}, which is not a player",
+                        node.player,
+                    ));
+                }
+                let elements =
+                    node.num_children as usize * self.private_cards[node.player as usize].len();
+                let elements_ip = match node.prev_action {
+                    Action::None | Action::Chance(_) => self.private_cards[1].len(),
+                    _ => 0,
+                };
+                (elements, elements_ip)
+            };
+            if node.num_elements as usize != expected_elements
+                || node.num_elements_ip as usize != expected_elements_ip
+            {
+                return Err(format!(
+                    "corrupt file: node {index} claims {}/{} storage elements where its \
+                     structure requires {expected_elements}/{expected_elements_ip}",
+                    node.num_elements, node.num_elements_ip,
+                ));
+            }
+
+            // A chance node at the boundary of a reduced storage mode legitimately points past
+            // the arena; the access guards refuse those. Everything else must stay inside it.
+            let is_boundary = node.is_chance()
+                && match node.turn {
+                    NOT_DEALT => self.storage_mode == BoardState::Flop,
+                    _ => self.storage_mode <= BoardState::Turn,
+                };
+            if !is_boundary {
+                let end = (node.children_offset as usize)
+                    .checked_add(node.num_children as usize)
+                    .and_then(|span| span.checked_add(index));
+                // `children_offset == 0` would make a node its own child: every recursive
+                // traversal (the solver, the finalizer run at the end of this very decode)
+                // would then recurse without end. The builder always lays children strictly
+                // after their parent, so offsets of at least 1 also keep the tree forward-only
+                // and every traversal finite.
+                if node.num_children == 0
+                    || node.children_offset == 0
+                    || end.is_none_or(|end| end > arena_len)
+                {
+                    return Err(format!(
+                        "corrupt file: node {index} points at children {}..+{}, which is not a \
+                         forward range inside the arena of {arena_len}",
+                        node.children_offset, node.num_children,
+                    ));
+                }
+            }
+
+            // A locked node's strategy is read with `.unwrap()` and trusted for its length.
+            if node.is_locked {
+                if node.is_chance() {
+                    return Err(format!("corrupt file: chance node {index} claims a lock"));
+                }
+                let expected =
+                    node.num_children as usize * self.private_cards[node.player as usize].len();
+                match self.locking_strategy.get(&index) {
+                    Some(strategy) if strategy.len() == expected => {}
+                    Some(strategy) => {
+                        return Err(format!(
+                            "corrupt file: node {index} lock has {} weights where its \
+                             strategy needs {expected}",
+                            strategy.len(),
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "corrupt file: node {index} is locked but carries no strategy"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // The reverse direction: every stored lock must belong to a locked node in the arena.
+        for (&index, _) in &self.locking_strategy {
+            if index >= arena_len || !self.node_arena[index].lock().is_locked {
+                return Err(format!(
+                    "corrupt file: a lock is stored for node {index}, which is not a locked \
+                     node of the arena"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns the number of storage elements required for the target storage mode.
     fn num_target_storage(&self) -> [usize; 4] {
         if self.state <= State::TreeBuilt {
@@ -107,6 +286,39 @@ thread_local! {
     static CHANCE_BASE: Cell<*const u8> = const { Cell::new(ptr::null()) };
     static PTR_BASE_MUT: Cell<[*mut u8; 3]> = const { Cell::new([ptr::null_mut(); 3]) };
     static CHANCE_BASE_MUT: Cell<*mut u8> = const { Cell::new(ptr::null_mut()) };
+    /// Lengths of the buffers the mutable bases point into — `[storage1, storage2, storage_ip,
+    /// storage_chance]` — plus the element width, so `PostFlopNode::decode` can refuse an
+    /// offset that would place a node's storage outside its buffer instead of building a
+    /// pointer from whatever the file says.
+    static STORAGE_LENS: Cell<[usize; 4]> = const { Cell::new([0; 4]) };
+    static STORAGE_NUM_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Validates one decoded storage offset: in bounds, aligned to the element width, with room for
+/// `num_elements` elements before the end of a buffer of `buffer_len` bytes.
+fn checked_offset(
+    offset: isize,
+    num_elements: usize,
+    num_bytes: usize,
+    buffer_len: usize,
+    what: &str,
+) -> Result<usize, DecodeError> {
+    let err = || {
+        DecodeError::OtherString(format!(
+            "corrupt file: {what} offset {offset} with {num_elements} elements does not fit \
+             its buffer of {buffer_len} bytes"
+        ))
+    };
+    let offset = usize::try_from(offset).map_err(|_| err())?;
+    if offset % num_bytes.max(1) != 0 {
+        return Err(err());
+    }
+    let len = num_elements.checked_mul(num_bytes).ok_or_else(err)?;
+    let end = offset.checked_add(len).ok_or_else(err)?;
+    if end > buffer_len {
+        return Err(err());
+    }
+    Ok(offset)
 }
 
 impl Encode for PostFlopGame {
@@ -210,6 +422,16 @@ impl<Context> Decode<Context> for PostFlopGame {
         game.target_storage_mode = game.storage_mode;
         if game.storage_mode == BoardState::River && game.state >= State::MemoryAllocated {
             let num_bytes = if game.is_compression_enabled { 2 } else { 4 };
+            // The encoder stores exactly `num_bytes * num_storage` bytes of `storage1` for a
+            // river-mode save, so a mismatch means the counters and the content disagree —
+            // refuse before sizing fresh allocations from the forged counter.
+            if game.storage1.len() as u64 != num_bytes * game.num_storage {
+                return Err(DecodeError::OtherString(format!(
+                    "corrupt file: storage length {} does not match its counter {}",
+                    game.storage1.len(),
+                    num_bytes * game.num_storage,
+                )));
+            }
             game.storage2 = vec![0; (num_bytes * game.num_storage) as usize];
             game.storage_ip = vec![0; (num_bytes * game.num_storage_ip) as usize];
             game.storage_chance = vec![0; (num_bytes * game.num_storage_chance) as usize];
@@ -236,12 +458,24 @@ impl<Context> Decode<Context> for PostFlopGame {
             }
         });
 
+        STORAGE_LENS.with(|c| {
+            c.set([
+                game.storage1.len(),
+                game.storage2.len(),
+                game.storage_ip.len(),
+                game.storage_chance.len(),
+            ]);
+        });
+        STORAGE_NUM_BYTES.with(|c| c.set(if game.is_compression_enabled { 2 } else { 4 }));
+
         // game tree
         game.node_arena = Decode::decode(decoder)?;
 
-        // initialization
+        // initialization — the structural validation runs before anything walks the tree
+        // (`back_to_root` already reads the arena)
         game.check_card_config().map_err(DecodeError::OtherString)?;
         game.init_card_fields();
+        game.validate_decoded().map_err(DecodeError::OtherString)?;
         game.init_interpreter();
         game.back_to_root();
 
@@ -312,22 +546,47 @@ impl<Context> Decode<Context> for PostFlopNode {
             ..Default::default()
         };
 
-        // pointers
+        // Pointers. The offsets come from the file, so each is bounds-checked against the
+        // buffer it indexes before any pointer is formed: an unchecked `base.offset(...)` here
+        // was an arbitrary-read/write primitive for anyone who could hand the process a file.
         if node.is_terminal() {
             // do nothing
         } else if node.is_chance() {
             let base = CHANCE_BASE_MUT.with(|c| c.get());
             if !base.is_null() {
-                node.storage1 = unsafe { base.offset(isize::decode(decoder)?) };
+                let lens = STORAGE_LENS.with(|c| c.get());
+                let num_bytes = STORAGE_NUM_BYTES.with(|c| c.get());
+                let offset = checked_offset(
+                    isize::decode(decoder)?,
+                    node.num_elements as usize,
+                    num_bytes,
+                    lens[3],
+                    "chance storage",
+                )?;
+                node.storage1 = unsafe { base.add(offset) };
             }
         } else {
             let bases = PTR_BASE_MUT.with(|c| c.get());
             if !bases[0].is_null() {
-                let offset = isize::decode(decoder)?;
-                let offset_ip = isize::decode(decoder)?;
-                node.storage1 = unsafe { bases[0].offset(offset) };
-                node.storage2 = unsafe { bases[1].offset(offset) };
-                node.storage3 = unsafe { bases[2].offset(offset_ip) };
+                let lens = STORAGE_LENS.with(|c| c.get());
+                let num_bytes = STORAGE_NUM_BYTES.with(|c| c.get());
+                let offset = checked_offset(
+                    isize::decode(decoder)?,
+                    node.num_elements as usize,
+                    num_bytes,
+                    lens[0].min(lens[1]),
+                    "node storage",
+                )?;
+                let offset_ip = checked_offset(
+                    isize::decode(decoder)?,
+                    node.num_elements_ip as usize,
+                    num_bytes,
+                    lens[2],
+                    "IP storage",
+                )?;
+                node.storage1 = unsafe { bases[0].add(offset) };
+                node.storage2 = unsafe { bases[1].add(offset) };
+                node.storage3 = unsafe { bases[2].add(offset_ip) };
             }
         }
 

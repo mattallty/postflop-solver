@@ -653,7 +653,7 @@ impl PostFlopGame {
 
     /// Counts the number of nodes in the game tree.
     #[inline]
-    fn count_num_nodes(&self) -> [u64; 3] {
+    pub(super) fn count_num_nodes(&self) -> [u64; 3] {
         let (turn_coef, river_coef) = match (self.card_config.turn, self.card_config.river) {
             (NOT_DEALT, _) => {
                 let mut river_coef = 0;

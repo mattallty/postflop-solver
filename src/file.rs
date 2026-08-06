@@ -35,6 +35,15 @@ pub trait FileData: Decode<()> + Encode {
     fn is_ready_to_save(&self) -> bool;
     #[doc(hidden)]
     fn estimated_memory_usage(&self) -> u64;
+    /// Validates invariants that `Decode` alone cannot enforce, right after decoding.
+    ///
+    /// A file is a trust boundary: everything the decoded value promises — counts, phases,
+    /// vector lengths — is a claim from the file, and this is where a claim that later code
+    /// relies on gets checked instead of trusted.
+    #[doc(hidden)]
+    fn check_decoded(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn encode_into_std_write<E: Encode, W: Write>(
@@ -213,12 +222,23 @@ pub fn load_data_from_std_read<T: FileData, R: Read>(
         decode_from_std_read(&mut zstd_decoder, "Failed to read data")?
     };
 
+    data.check_decoded()?;
+
     Ok((data, memo))
 }
 
 /// Loads data from a file.
 ///
 /// This function deserializes the data from a file specified by `path`.
+///
+/// The decoded structure is validated: storage offsets are bounds-checked against their
+/// buffers, node counts are recomputed from the decoded tree rather than trusted, children and
+/// locking strategies must stay within the arena, and a [`BunchingData`] must be internally
+/// consistent — so a corrupt or crafted file is answered with `Err` rather than out-of-bounds
+/// memory access. One caveat remains: a few allocation sizes are taken from the file before
+/// they can be cross-checked, so an adversarial file can still make this function allocate
+/// large amounts of memory up to `max_memory_usage` (or without bound if `None` is passed) —
+/// pass a limit when the file comes from outside.
 ///
 /// # Arguments
 ///
@@ -264,6 +284,10 @@ impl FileData for BunchingData {
 
     fn estimated_memory_usage(&self) -> u64 {
         self.memory_usage()
+    }
+
+    fn check_decoded(&self) -> Result<(), String> {
+        self.check_decoded()
     }
 }
 

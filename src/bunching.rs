@@ -246,6 +246,55 @@ impl BunchingData {
         self.phase == 3 && self.progress_percent == 100
     }
 
+    /// Validates the invariants a decoded instance must satisfy.
+    ///
+    /// A file is a trust boundary: `phase`, `progress_percent`, the flop, and every vector
+    /// length are claims from the file. In particular, `is_ready()` derived from forged
+    /// phase fields with empty result vectors would send `set_bunching_effect` indexing into
+    /// nothing, and an unsorted or out-of-range flop trips `compress_mask` on its assertions.
+    pub(crate) fn check_decoded(&self) -> Result<(), String> {
+        if self.fold_ranges.is_empty() || self.fold_ranges.len() > 4 {
+            return Err(format!(
+                "corrupt file: {} fold ranges where 1 to 4 are possible",
+                self.fold_ranges.len(),
+            ));
+        }
+        for range in &self.fold_ranges {
+            if range.is_empty() || !range.is_suit_symmetric() {
+                return Err("corrupt file: a fold range is empty or not suit-symmetric".to_string());
+            }
+        }
+
+        if !(self.flop[0] < self.flop[1] && self.flop[1] < self.flop[2] && self.flop[2] < 52) {
+            return Err(format!("corrupt file: invalid flop {:?}", self.flop));
+        }
+
+        if self.phase > 3 || self.progress_percent > 100 {
+            return Err(format!(
+                "corrupt file: phase {} at {}% is not a state processing can reach",
+                self.phase, self.progress_percent,
+            ));
+        }
+
+        // A ready instance is consumed through `result_4cards`/`5cards`/`6cards`, which index
+        // these three vectors by combinatorial rank; each has exactly one valid length.
+        if self.is_ready()
+            && (self.result4.len() != COMB_49_4
+                || self.result5.len() != COMB_49_5
+                || self.result6.len() != COMB_49_6)
+        {
+            return Err(format!(
+                "corrupt file: claims to be ready but its result tables hold {}/{}/{} entries \
+                 where {COMB_49_4}/{COMB_49_5}/{COMB_49_6} are required",
+                self.result4.len(),
+                self.result5.len(),
+                self.result6.len(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Returns the current phase (0-3).
     #[inline]
     pub fn phase(&self) -> u8 {

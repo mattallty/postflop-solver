@@ -147,13 +147,57 @@ pub struct ActionTree {
 }
 
 #[derive(Default)]
-#[cfg_attr(feature = "bincode", derive(Decode, Encode))]
+#[cfg_attr(feature = "bincode", derive(Encode))]
 pub(crate) struct ActionTreeNode {
     pub(crate) player: u8,
     pub(crate) board_state: BoardState,
     pub(crate) amount: i32,
     pub(crate) actions: Vec<Action>,
     pub(crate) children: Vec<MutexLike<ActionTreeNode>>,
+}
+
+/// The deepest action tree a file may describe.
+///
+/// Real trees stay far below this: raises at least double the pot share, so a betting sequence
+/// is tens of actions at the extreme, times three streets. The bound exists for the decoder —
+/// this is the crate's one recursive type, and both decoding and dropping it recurse per
+/// level, so a corrupt or crafted file claiming a deeply nested tree would otherwise overflow
+/// the stack (an abort, not an `Err`) before any validation sees it.
+#[cfg(feature = "bincode")]
+const MAX_DECODE_DEPTH: usize = 100;
+
+#[cfg(feature = "bincode")]
+thread_local! {
+    static DECODE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Hand-written (matching the derive's field order) so the recursion can be depth-limited.
+#[cfg(feature = "bincode")]
+impl<Context> Decode<Context> for ActionTreeNode {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let depth = DECODE_DEPTH.with(|d| d.get());
+        if depth >= MAX_DECODE_DEPTH {
+            return Err(bincode::error::DecodeError::OtherString(format!(
+                "corrupt file: the action tree nests deeper than {MAX_DECODE_DEPTH} levels"
+            )));
+        }
+        DECODE_DEPTH.with(|d| d.set(depth + 1));
+
+        let result = (|| {
+            Ok(Self {
+                player: Decode::decode(decoder)?,
+                board_state: Decode::decode(decoder)?,
+                amount: Decode::decode(decoder)?,
+                actions: Decode::decode(decoder)?,
+                children: Decode::decode(decoder)?,
+            })
+        })();
+
+        DECODE_DEPTH.with(|d| d.set(depth));
+        result
+    }
 }
 
 struct BuildTreeInfo {

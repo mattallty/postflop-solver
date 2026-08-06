@@ -1766,3 +1766,121 @@ fn node_storage_accessors_tolerate_unallocated_memory() {
     assert!(game.root().regrets().is_empty());
     assert!(game.root().cfvalues().is_empty());
 }
+
+#[test]
+fn loading_a_tampered_bunching_file_is_an_error_not_a_panic() {
+    // A freshly constructed BunchingData has phase 0 and every table empty, and its encoding
+    // ends with [phase, progress, thirteen empty-vec length bytes]. Forging phase 3 at 100%
+    // produces a file that claims `is_ready()` with no result tables behind the claim — which
+    // used to load successfully and then panic inside `set_bunching_effect`.
+    let range = "22+,A2s+,A2o+".parse::<Range>().unwrap();
+    let data = BunchingData::new(&[range], flop_from_str("Td9d6h").unwrap()).unwrap();
+
+    // `save_data_into_std_write` refuses data that is not ready, so build the file by hand:
+    // the header (magic, version, no compression, bunching data type, memory estimate, memo)
+    // followed by the encoded body — exactly what the writer produces for ready data.
+    let config = bincode::config::standard();
+    let mut buf = Vec::new();
+    bincode::encode_into_std_write(0x09f1_5790u32, &mut buf, config).unwrap();
+    bincode::encode_into_std_write(1u8, &mut buf, config).unwrap();
+    bincode::encode_into_std_write(0u8, &mut buf, config).unwrap();
+    bincode::encode_into_std_write(1u8, &mut buf, config).unwrap();
+    bincode::encode_into_std_write(0u64, &mut buf, config).unwrap();
+    bincode::encode_into_std_write("", &mut buf, config).unwrap();
+    bincode::encode_into_std_write(&data, &mut buf, config).unwrap();
+
+    // A fresh instance encodes phase 0 at 0% followed by thirteen empty tables — sanity-check
+    // that layout, then forge "phase 3, 100%".
+    let len = buf.len();
+    assert_eq!(&buf[len - 15..], [0; 15]);
+    buf[len - 15] = 3; // phase
+    buf[len - 14] = 100; // progress_percent
+
+    let result: Result<(BunchingData, String), String> =
+        load_data_from_std_read(&mut buf.as_slice(), None);
+    let err = result.err().expect("a forged ready-claim must be refused");
+    assert!(err.contains("ready"), "{err}");
+}
+
+/// Flips one low and one high bit at every `step`-th byte of `original` and asserts the decode
+/// answers each with `Err` or a game — never a panic.
+fn assert_bit_flips_never_panic(original: &[u8], step: usize, label: &str) {
+    for index in (0..original.len()).step_by(step) {
+        for bit in [0x01u8, 0x80u8] {
+            let mut tampered = original.to_vec();
+            tampered[index] ^= bit;
+
+            let outcome = std::panic::catch_unwind(|| {
+                let result: Result<(PostFlopGame, String), String> =
+                    load_data_from_std_read(&mut tampered.as_slice(), None);
+                result.is_ok()
+            });
+            assert!(
+                outcome.is_ok(),
+                "{label}: flipping bit {bit:#04x} of byte {index} panicked the decoder"
+            );
+        }
+    }
+}
+
+#[test]
+fn loading_a_bit_flipped_game_file_never_panics() {
+    // A file is a trust boundary: whatever a flipped bit does to the decode, the answer must be
+    // `Err` or a well-formed game — never a panic, and never (checked by the validation layer
+    // in `serialization.rs`) a pointer built from unchecked file contents. This exhaustive pass
+    // found four distinct crashes when it was written: forged element counts, a node that was
+    // its own child (unbounded recursion), impossible board cards on a node (empty
+    // strength-table entries), and a nesting depth that overflowed the decode stack.
+    let mut game = tiny_river_game();
+    game.play(0);
+
+    let mut original = Vec::new();
+    save_data_into_std_write(&game, "memo", &mut original, None).unwrap();
+
+    let step = (original.len() / 8192).max(1);
+    assert_bit_flips_never_panic(&original, step, "river");
+}
+
+#[test]
+fn loading_a_bit_flipped_turn_game_file_never_panics() {
+    // The same trust-boundary sweep over a game with chance nodes, saved both in full and with
+    // the river street truncated away — the truncated file exercises the storage-boundary
+    // decode paths (prefix arena, prefix buffers) the river file cannot.
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: 60,
+        effective_stack: 60,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    let mut full = Vec::new();
+    save_data_into_std_write(&game, "", &mut full, None).unwrap();
+
+    game.set_target_storage_mode(BoardState::Turn).unwrap();
+    let mut truncated = Vec::new();
+    save_data_into_std_write(&game, "", &mut truncated, None).unwrap();
+
+    // Sparser than the river sweep — two files, and the ranges that dominate the bytes are
+    // already swept exhaustively there.
+    assert_bit_flips_never_panic(&full, (full.len() / 4096).max(2), "full turn");
+    assert_bit_flips_never_panic(
+        &truncated,
+        (truncated.len() / 4096).max(2),
+        "truncated turn",
+    );
+}
