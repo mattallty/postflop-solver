@@ -51,6 +51,14 @@ impl Hand {
 
     #[inline]
     pub fn evaluate(&self) -> u16 {
+        // `evaluate_internal` reads all seven card slots and `keep_n_msb` shifts by 63 on an
+        // empty rankset, so a partially filled hand can produce a value absent from the table
+        // and panic on the `unwrap`. Every current caller builds exactly seven cards; this
+        // pins that invariant where a future caller would trip it.
+        debug_assert_eq!(
+            self.num_cards, 7,
+            "evaluate requires a complete 7-card hand"
+        );
         HAND_TABLE.binary_search(&self.evaluate_internal()).unwrap() as u16
     }
 

@@ -472,6 +472,24 @@ impl ActionTree {
             ));
         }
 
+        // The tree builder computes expressions up to the shape of
+        // `starting_pot + 8 * effective_stack` in `i32`; a bound of `i32::MAX / 16` on each
+        // input keeps every one of them from overflowing (which wrapped to negative pots in
+        // release and produced silently wrong bet sizing).
+        const MAX_AMOUNT: i32 = i32::MAX / 16;
+        if config.starting_pot > MAX_AMOUNT {
+            return Err(format!(
+                "Starting pot must not exceed {MAX_AMOUNT}: {}",
+                config.starting_pot
+            ));
+        }
+        if config.effective_stack > MAX_AMOUNT {
+            return Err(format!(
+                "Effective stack must not exceed {MAX_AMOUNT}: {}",
+                config.effective_stack
+            ));
+        }
+
         if config.rake_rate < 0.0 {
             return Err(format!(
                 "Rake rate must be non-negative: {}",

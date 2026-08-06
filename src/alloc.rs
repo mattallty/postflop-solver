@@ -88,7 +88,13 @@ impl StackAllocData {
         self.index = (self.index as isize + 1) as usize;
         if self.index == self.base.len() {
             let layout = Layout::from_size_align(STACK_UNIT, ALIGNMENT).unwrap();
-            let ptr = unsafe { alloc::alloc(layout) } as usize;
+            let ptr = unsafe { alloc::alloc(layout) };
+            if ptr.is_null() {
+                // Abort with the allocator's own diagnostic rather than pushing a null base
+                // that `allocate` would immediately build a slice from.
+                alloc::handle_alloc_error(layout);
+            }
+            let ptr = ptr as usize;
             self.base.push(ptr);
             self.current.push(ptr);
         }

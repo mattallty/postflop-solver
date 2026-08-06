@@ -19,6 +19,9 @@ use bincode::{Decode, Encode};
 ///   - Plus range (e.g., "TT+", "ATs+", "T9o+")
 ///   - Dash range (e.g., "QQ-88", "A9s-A6s", "98o-65o")
 ///
+/// Case is not significant, and if entries assign a combination more than one weight, the
+/// **first** entry wins: `"AA:0.5,AA"` gives every AA combination weight `0.5`.
+///
 /// # Examples
 /// ```
 /// use postflop_solver::Range;
@@ -315,7 +318,9 @@ pub fn card_from_str(s: &str) -> Result<Card, String> {
 #[inline]
 pub fn flop_from_str(s: &str) -> Result<[Card; 3], String> {
     let mut result = [0; 3];
-    let mut chars = s.chars();
+    // Trimmed first: whitespace *between* cards was already skipped, so accepting " 2c3d4h "
+    // while rejecting "2c 3d 4h " was an inconsistency rather than a policy.
+    let mut chars = s.trim().chars();
 
     result[0] = card_from_chars(&mut chars)?;
     result[1] = card_from_chars(&mut chars.by_ref().skip_while(|c| c.is_whitespace()))?;
@@ -493,6 +498,9 @@ impl Range {
     /// characters. Therefore, this method can bypass the regular expression processing. If you want
     /// to create a range from a regular string, use `parse::<Range>()` instead.
     pub fn from_sanitized_str(ranges: &str) -> Result<Self, String> {
+        // Case-normalized: rank characters were accepted in either case but suits and the
+        // s/o suffix only in lowercase, so "AKs" parsed while "AKS" and "AcKH" did not.
+        let ranges = ranges.to_lowercase();
         let mut ranges = ranges.split(',').collect::<Vec<_>>();
 
         // remove last empty element if any
@@ -550,7 +558,7 @@ impl Range {
 
     /// Obtains the weight of a specified hand.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `card1` or `card2` is not less than `52`
     ///   - `card1` is equal to `card2`
     #[inline]
@@ -560,7 +568,7 @@ impl Range {
 
     /// Obtains the average weight of specified pair hands.
     ///
-    /// Undefined behavior if `rank` is not less than `13`.
+    /// Panics if `rank` is not less than `13`.
     #[inline]
     pub fn get_weight_pair(&self, rank: u8) -> f32 {
         self.get_average_weight(&pair_indices(rank))
@@ -568,7 +576,7 @@ impl Range {
 
     /// Obtains the average weight of specified suited hands.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `rank1` or `rank2` is not less than `13`
     ///   - `rank1` is equal to `rank2`
     #[inline]
@@ -578,7 +586,7 @@ impl Range {
 
     /// Obtains the average weight of specified offsuit hands.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `rank1` or `rank2` is not less than `13`
     ///   - `rank1` is equal to `rank2`
     #[inline]
@@ -588,7 +596,7 @@ impl Range {
 
     /// Sets the weight of a specified hand.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `card1` or `card2` is not less than `52`
     ///   - `card1` is equal to `card2`
     ///   - `weight` is not in the range `[0.0, 1.0]`
@@ -599,7 +607,7 @@ impl Range {
 
     /// Sets the weights of specified pair hands.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `rank` is not less than `13`
     ///   - `weight` is not in the range `[0.0, 1.0]`
     #[inline]
@@ -609,7 +617,7 @@ impl Range {
 
     /// Sets the weights of specified suited hands.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `rank1` or `rank2` is not less than `13`
     ///   - `rank1` is equal to `rank2`
     ///   - `weight` is not in the range `[0.0, 1.0]`
@@ -620,7 +628,7 @@ impl Range {
 
     /// Sets the weights of specified offsuit hands.
     ///
-    /// Undefined behavior if:
+    /// Panics if:
     ///   - `rank1` or `rank2` is not less than `13`
     ///   - `rank1` is equal to `rank2`
     ///   - `weight` is not in the range `[0.0, 1.0]`
@@ -714,7 +722,12 @@ impl Range {
 
     #[inline]
     fn update_with_plus_range(&mut self, range: &str, weight: f32) -> Result<(), String> {
-        let lowest_combo = &range[..range.len() - 1];
+        // `strip_suffix` rather than byte slicing: on input that does not end with '+' (for
+        // example a stray multi-byte character), slicing panicked on a char boundary where a
+        // `Result`-returning parser must answer `Err`.
+        let lowest_combo = range
+            .strip_suffix('+')
+            .ok_or_else(|| format!("Invalid range: {range}"))?;
         let (rank1, rank2, suitedness) = parse_singleton(lowest_combo)?;
         let gap = rank1 - rank2;
         if gap <= 1 {
@@ -734,6 +747,11 @@ impl Range {
     #[inline]
     fn update_with_dash_range(&mut self, range: &str, weight: f32) -> Result<(), String> {
         let combo_pair = range.split('-').collect::<Vec<_>>();
+        // Exactly two endpoints: "AA-KK-QQ" used to silently parse as "AA-KK", accepting a
+        // malformed range with a different meaning than written.
+        if combo_pair.len() != 2 {
+            return Err(format!("Invalid range: {range}"));
+        }
         let (rank11, rank12, suitedness) = parse_singleton(combo_pair[0])?;
         let (rank21, rank22, suitedness2) = parse_singleton(combo_pair[1])?;
         let gap = rank11 - rank12;
@@ -956,7 +974,10 @@ impl FromStr for Range {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = TRIM_REGEX.replace_all(s, "$1").trim().to_string();
+        // Lowercased for the same reason as `from_sanitized_str`: the pattern accepts ranks in
+        // either case but suits and the s/o suffix only in lowercase.
+        let s = s.to_lowercase();
+        let s = TRIM_REGEX.replace_all(&s, "$1").trim().to_string();
         let mut ranges = s.split(',').collect::<Vec<_>>();
 
         // remove last empty element if any
@@ -1004,6 +1025,49 @@ impl std::fmt::Display for Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitized_parser_rejects_malformed_input_without_panicking() {
+        // Byte-slicing panicked on a trailing multi-byte character.
+        assert!(Range::from_sanitized_str("QQ+é").is_err());
+        // Extra dash segments were silently dropped: this parsed as "AA-KK".
+        assert!(Range::from_sanitized_str("AA-KK-QQ").is_err());
+        // A bare "+" or "-" must be an error, not a slice panic.
+        assert!(Range::from_sanitized_str("+").is_err());
+        assert!(Range::from_sanitized_str("-").is_err());
+    }
+
+    #[test]
+    fn parsing_is_case_insensitive() {
+        let canonical = "AKs,QQ+".parse::<Range>().unwrap();
+        for spelling in ["aks,qq+", "AKS,QQ+", "Aks,qQ+"] {
+            assert_eq!(spelling.parse::<Range>().unwrap(), canonical, "{spelling}");
+            assert_eq!(
+                Range::from_sanitized_str(spelling).unwrap(),
+                canonical,
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            "AcKh".parse::<Range>().unwrap(),
+            "aCkH".parse::<Range>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_first_entry_wins_on_duplicates() {
+        let range = "AA:0.5,AA".parse::<Range>().unwrap();
+        assert_eq!(range.get_weight_pair(12), 0.5);
+        let range = "AA,AA:0.5".parse::<Range>().unwrap();
+        assert_eq!(range.get_weight_pair(12), 1.0);
+    }
+
+    #[test]
+    fn flop_from_str_ignores_surrounding_whitespace() {
+        let expected = flop_from_str("2c3d4h").unwrap();
+        assert_eq!(flop_from_str(" 2c3d4h ").unwrap(), expected);
+        assert_eq!(flop_from_str("2c 3d 4h ").unwrap(), expected);
+    }
 
     #[test]
     fn range_regex() {
