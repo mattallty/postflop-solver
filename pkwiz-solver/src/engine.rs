@@ -236,7 +236,15 @@ fn construct_validated(
         river: board.get(4).copied().map_or(NOT_DEALT, to_engine_card),
     };
 
-    let action_tree = ActionTree::new(validated.tree_config.clone()).map_err(EngineError::Tree)?;
+    let mut action_tree =
+        ActionTree::new(validated.tree_config.clone()).map_err(EngineError::Tree)?;
+    // Edits before `with_config`, so everything downstream — the memory estimate, the TooBig
+    // check, the solve — sees the edited tree without knowing edits exist.
+    crate::spot::apply_edits(
+        &mut action_tree,
+        &validated.added_lines,
+        &validated.removed_lines,
+    )?;
     let game = PostFlopGame::with_config(card_config, action_tree).map_err(EngineError::Build)?;
 
     let (uncompressed, compressed) = game.memory_usage();

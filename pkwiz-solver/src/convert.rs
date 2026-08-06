@@ -73,9 +73,108 @@ pub fn hole_to_string(hole: (EngineCard, EngineCard)) -> Result<String, String> 
     Ok(format!("{hi}{lo}"))
 }
 
+/// One engine action, rendered the way `NodeView.actions` shows it.
+///
+/// This and [`action_from_str`] are deliberate inverses: hosts compose edit lines by copying
+/// strings out of `NodeView`, so the grammar is exact-match on this rendering.
+#[must_use]
+pub fn action_to_string(action: &postflop_solver::Action) -> String {
+    use postflop_solver::Action;
+    match action {
+        Action::None => "None".to_owned(),
+        Action::Fold => "Fold".to_owned(),
+        Action::Check => "Check".to_owned(),
+        Action::Call => "Call".to_owned(),
+        Action::Bet(n) => format!("Bet({n})"),
+        Action::Raise(n) => format!("Raise({n})"),
+        Action::AllIn(n) => format!("AllIn({n})"),
+        Action::Chance(c) => {
+            from_engine_card(*c).map_or_else(|_| "Chance(?)".to_owned(), |c| format!("Chance({c})"))
+        }
+    }
+}
+
+/// The inverse of [`action_to_string`], for the actions a line may contain.
+///
+/// Accepts exactly `Fold`, `Check`, `Call`, and `Bet(n)`/`Raise(n)`/`AllIn(n)` with `n` a
+/// positive integer — case-sensitive, because exactness against the `NodeView` rendering is
+/// the contract, and a second, lenient grammar would have to stay compatible forever.
+///
+/// # Errors
+///
+/// A reason naming what was wrong. `Chance(..)` gets a targeted one: chance actions are
+/// omitted from lines, because the tree treats all turn/river cards as one node.
+pub fn action_from_str(s: &str) -> Result<postflop_solver::Action, String> {
+    use postflop_solver::Action;
+    match s {
+        "Fold" => return Ok(Action::Fold),
+        "Check" => return Ok(Action::Check),
+        "Call" => return Ok(Action::Call),
+        _ => {}
+    }
+    if s.starts_with("Chance(") {
+        return Err(
+            "chance actions are omitted from lines; the tree treats all turn/river \
+                    cards as one node, so card-specific edits are not supported"
+                .to_owned(),
+        );
+    }
+    for (prefix, build) in [
+        ("Bet(", Action::Bet as fn(i32) -> Action),
+        ("Raise(", Action::Raise as fn(i32) -> Action),
+        ("AllIn(", Action::AllIn as fn(i32) -> Action),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            let Some(digits) = rest.strip_suffix(')') else {
+                return Err(format!("`{s}` is missing its closing parenthesis"));
+            };
+            let amount = digits
+                .parse::<i64>()
+                .map_err(|_| format!("`{digits}` is not an amount"))?;
+            if amount <= 0 || amount > i64::from(i32::MAX) {
+                return Err(format!("`{digits}` is not a positive 32-bit amount"));
+            }
+            return Ok(build(amount as i32));
+        }
+    }
+    Err(format!(
+        "`{s}` is not an action; expected Fold, Check, Call, Bet(n), Raise(n) or AllIn(n)"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actions_round_trip_between_render_and_parse() {
+        use postflop_solver::Action;
+        for action in [
+            Action::Fold,
+            Action::Check,
+            Action::Call,
+            Action::Bet(1),
+            Action::Raise(188),
+            Action::AllIn(i32::MAX),
+        ] {
+            let rendered = action_to_string(&action);
+            assert_eq!(action_from_str(&rendered), Ok(action), "{rendered}");
+        }
+        for bad in [
+            "",
+            "bet(50)",
+            "Bet(0)",
+            "Bet(-5)",
+            "Bet(2147483648)",
+            "Bet(50",
+            "None",
+        ] {
+            assert!(action_from_str(bad).is_err(), "`{bad}` should not parse");
+        }
+        assert!(action_from_str("Chance(Qc)")
+            .unwrap_err()
+            .contains("chance actions are omitted"));
+    }
 
     #[test]
     fn the_two_card_encodings_agree_on_all_fifty_two() {

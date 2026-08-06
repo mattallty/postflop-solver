@@ -25,7 +25,9 @@
 //! host and this solver cannot disagree about what `JTs-67s` means.
 
 use pkwiz_range::Card;
-use postflop_solver::{BetSizeOptions, BoardState, DonkSizeOptions, TreeConfig};
+use postflop_solver::{
+    Action, ActionTree, BetSizeOptions, BoardState, DonkSizeOptions, TreeConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// A range, either as notation or already expanded.
@@ -311,6 +313,19 @@ pub struct Spot {
     /// Free-text note stored alongside a saved solution — the hand id it came from, typically.
     #[serde(default)]
     pub memo: Option<String>,
+    /// Extra action lines grafted onto the tree the sizing produced, before `removedLines`.
+    ///
+    /// Each line is a comma-separated path of actions in `NodeView.actions`' exact rendering
+    /// (`"Bet(300)"`, `"Bet(300), Raise(900)"`); amounts are the street-cumulative integers
+    /// NodeView shows. Chance actions are omitted — the tree treats all turn/river cards as
+    /// one node. The subtree under an added action gets the spot's normal sizing, so its
+    /// default lines can themselves be pruned by `removedLines` (adds apply first).
+    #[serde(default)]
+    pub added_lines: Vec<String>,
+    /// Action lines pruned from the tree, applied after `addedLines`. Same grammar; the
+    /// amounts must be the exact integers the engine derived (the numbers NodeView renders).
+    #[serde(default)]
+    pub removed_lines: Vec<String>,
     /// Strategies to pin before the CFR loop.
     ///
     /// Applied to the freshly built tree, in order, after memory allocation and before
@@ -378,6 +393,8 @@ impl Spot {
             save_path: None,
             compression_level: default_compression_level(),
             memo: None,
+            added_lines: Vec::new(),
+            removed_lines: Vec::new(),
             locks: Vec::new(),
         }
     }
@@ -495,13 +512,102 @@ impl Spot {
             }
         }
 
+        // Tree edits: parse every line, then dry-run them against a throwaway tree so a bad
+        // edit fails this command rather than a job a moment later. The dry-run only happens
+        // when edits are present, and an `ActionTree::new` failure is left for `construct` to
+        // report exactly as today.
+        if self.added_lines.len() + self.removed_lines.len() > 512 {
+            return Err(SpotError::Line {
+                line: "…".to_owned(),
+                reason: "too many lines (the cap is 512)".to_owned(),
+            });
+        }
+        let added_lines = parse_lines(&self.added_lines)?;
+        let removed_lines = parse_lines(&self.removed_lines)?;
+        if !(added_lines.is_empty() && removed_lines.is_empty()) {
+            if let Ok(mut tree) = ActionTree::new(tree_config.clone()) {
+                apply_edits(&mut tree, &added_lines, &removed_lines)?;
+            }
+        }
+
         Ok(Validated {
             board,
             oop,
             ip,
             tree_config,
+            added_lines,
+            removed_lines,
         })
     }
+}
+
+/// Parse each edit line into engine actions, rejecting anything the grammar does not name.
+fn parse_lines(lines: &[String]) -> Result<Vec<Vec<Action>>, SpotError> {
+    lines
+        .iter()
+        .map(|line| {
+            let err = |reason: String| SpotError::Line {
+                line: line.clone(),
+                reason,
+            };
+            let segments: Vec<&str> = line.split(',').map(str::trim).collect();
+            if segments.iter().any(|s| s.is_empty()) {
+                return Err(err(
+                    "a line needs at least one action, and no empty ones".to_owned()
+                ));
+            }
+            if segments.len() > 64 {
+                return Err(err(
+                    "too many actions in one line (the cap is 64)".to_owned()
+                ));
+            }
+            segments
+                .into_iter()
+                .map(|s| crate::convert::action_from_str(s).map_err(&err))
+                .collect()
+        })
+        .collect()
+}
+
+/// Render a parsed line back into the canonical grammar, for error messages.
+fn render_line(line: &[Action]) -> String {
+    if line.is_empty() {
+        return "(root)".to_owned();
+    }
+    line.iter()
+        .map(|a| crate::convert::action_to_string(a))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Apply parsed edits to a built tree: all adds (in order), then all removes (in order), then
+/// refuse any edit set that left a node with no actions — `ActionTree::remove_line` has no
+/// last-action guard, and the game constructor's later refusal names no line.
+pub(crate) fn apply_edits(
+    tree: &mut ActionTree,
+    added: &[Vec<Action>],
+    removed: &[Vec<Action>],
+) -> Result<(), SpotError> {
+    for line in added {
+        tree.add_line(line).map_err(|reason| SpotError::Edit {
+            op: "add",
+            line: render_line(line),
+            reason,
+        })?;
+    }
+    for line in removed {
+        tree.remove_line(line).map_err(|reason| SpotError::Edit {
+            op: "remove",
+            line: render_line(line),
+            reason,
+        })?;
+    }
+    if let Some(path) = tree.invalid_terminals().first() {
+        return Err(SpotError::EmptyNode {
+            line: render_line(path),
+        });
+    }
+    Ok(())
 }
 
 fn pair(options: BetSizeOptions) -> [BetSizeOptions; 2] {
@@ -525,6 +631,8 @@ pub struct Validated {
     pub oop: pkwiz_range::Range,
     pub ip: pkwiz_range::Range,
     pub tree_config: TreeConfig,
+    pub added_lines: Vec<Vec<Action>>,
+    pub removed_lines: Vec<Vec<Action>>,
 }
 
 /// A spot the caller described badly.
@@ -548,6 +656,16 @@ pub enum SpotError {
     EmptyRange { player: &'static str },
     #[error("`locks[{index}]` is invalid: {reason}")]
     Lock { index: usize, reason: String },
+    #[error("`{line}` is not an action line: {reason}")]
+    Line { line: String, reason: String },
+    #[error("cannot {op} the line `{line}`: {reason}")]
+    Edit {
+        op: &'static str,
+        line: String,
+        reason: String,
+    },
+    #[error("these edits leave the node after `{line}` with no actions")]
+    EmptyNode { line: String },
 }
 
 #[cfg(test)]

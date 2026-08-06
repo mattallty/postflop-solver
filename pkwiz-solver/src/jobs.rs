@@ -487,8 +487,10 @@ impl Jobs {
             save_path: None,
             compression_level: crate::spot::Spot::default_compression_level(),
             memo: Some(memo),
-            // A reopened file's locks live in the game itself (the engine serializes them);
-            // this placeholder spot is never used to rebuild.
+            // A reopened file's locks and tree edits live in the game itself (the engine
+            // serializes them); this placeholder spot is never used to rebuild.
+            added_lines: Vec::new(),
+            removed_lines: Vec::new(),
             locks: Vec::new(),
         };
 
@@ -961,15 +963,5 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
 }
 
 fn render_action(action: &Action) -> String {
-    match action {
-        Action::None => "None".to_owned(),
-        Action::Fold => "Fold".to_owned(),
-        Action::Check => "Check".to_owned(),
-        Action::Call => "Call".to_owned(),
-        Action::Bet(n) => format!("Bet({n})"),
-        Action::Raise(n) => format!("Raise({n})"),
-        Action::AllIn(n) => format!("AllIn({n})"),
-        Action::Chance(c) => crate::convert::from_engine_card(*c)
-            .map_or_else(|_| "Chance(?)".to_owned(), |c| format!("Chance({c})")),
-    }
+    crate::convert::action_to_string(action)
 }
