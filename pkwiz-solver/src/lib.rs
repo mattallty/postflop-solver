@@ -70,9 +70,14 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub use engine::{EngineError, MemoryEstimate, Sample, Solved, Stopped, DEFAULT_MEMORY_LIMIT};
-pub use jobs::{Emit, JobError, JobId, JobStatus, Jobs, NodeView, Phase, Silent};
+pub use jobs::{
+    BunchingStatus, Emit, JobError, JobId, JobKind, JobStatus, Jobs, NodeView, Phase, Silent,
+};
 pub use protocol::{execute, Command, OpError, PROTOCOL_VERSION};
-pub use spot::{BoardSpec, Lock, RangeSpec, Sizing, Spot, SpotError, Stop, StreetSizing};
+pub use spot::{
+    BoardSpec, BunchingRef, BunchingSpec, Lock, RangeSpec, Sizing, Spot, SpotError, Stop,
+    StreetSizing,
+};
 
 /// One request line.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -88,8 +93,8 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorBody {
     /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`, `engine`,
-    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `never_ran`, `serialize`, or
-    /// `panic`.
+    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `never_ran`, `not_bunching`,
+    /// `bunching_not_ready`, `bunching_unavailable`, `serialize`, or `panic`.
     pub code: String,
     pub message: String,
 }

@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use postflop_solver::{
-    compute_current_ev, compute_exploitability, finalize, solve_step, ActionTree, CardConfig,
-    PostFlopGame, NOT_DEALT,
+    compute_current_ev, compute_exploitability, finalize, solve_step, ActionTree, BunchingData,
+    CardConfig, PostFlopGame, NOT_DEALT,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::convert::{to_engine_card, to_engine_range};
-use crate::spot::{Spot, SpotError, Validated};
+use crate::spot::{BunchingSpec, Spot, SpotError, Validated};
 
 /// Refuse a tree bigger than this unless the caller raises it.
 ///
@@ -27,6 +27,38 @@ use crate::spot::{Spot, SpotError, Validated};
 /// the configuration is genuinely ambitious rather than that the limit is mean. The point is that
 /// an ambitious tree gets a message instead of an OOM kill.
 pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Peak live bytes of a bunching preparation, indexed by fold-player count minus one.
+///
+/// The engine allocates nothing until the phases run, so the only way to refuse a preparation
+/// that would not fit is to know its peak in advance. Hand-derived from the `COMB_49_k`
+/// constants at the top of the engine's `src/bunching.rs` (choose k of the 49 cards outside the
+/// flop) and its documented phase schedule:
+///
+/// - The results, allocated by `phase3_prepare` and kept for the life of the data:
+///   4·(C(49,4) + C(49,5) + C(49,6)) = 4·(211 876 + 1 906 884 + 13 983 816) = 64 410 304 bytes
+///   of `f32`.
+/// - The `f64` sum tables, allocated by `phase2_prepare` for dead-card counts `0..=2n` and
+///   freed only when phase 3 completes, so they are live alongside the results:
+///   8·Σ C(49,k) for k `0..=2n` — 9 808 (n=1), 1 852 208 (n=2), 128 977 808 (n=3).
+/// - Four fold players peak earlier, during phase 2: `temp_table3` at 8·C(49,8) =
+///   3 607 824 528 bytes, plus the sum tables for `0..=6` — the table above C(49,6) is never
+///   allocated as a sum.
+/// - Plus an 8 MiB allowance for what the derivation deliberately ignores: the struct itself,
+///   the fold ranges, and the small phase-1 temporaries (about 6 KB observed for one fold
+///   player) — generous against those, immaterial against the 62 MB result.
+///
+/// If the engine ever reschedules its phases these go stale, which is why the worker logs (in
+/// debug builds, and never fails a job) whenever live usage exceeds the claim.
+pub const PEAK_BUNCHING_BYTES: [u64; 4] = {
+    const ALLOWANCE: u64 = 8 * 1024 * 1024;
+    [
+        64_410_304 + 9_808 + ALLOWANCE, // 1 fold player: results + sums 0..=2
+        64_410_304 + 1_852_208 + ALLOWANCE, // 2: results + sums 0..=4
+        64_410_304 + 128_977_808 + ALLOWANCE, // 3: results + sums 0..=6
+        3_607_824_528 + 128_977_808 + ALLOWANCE, // 4: phase-2 temp table + sums 0..=6
+    ]
+};
 
 /// Why a solve could not be built or run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +81,12 @@ pub enum EngineError {
     Load { path: String, reason: String },
     #[error("locks[{index}] cannot be applied: {reason}")]
     Lock { index: usize, reason: String },
+    #[error("preparing bunching data for {fold_players} fold players peaks at {peak} bytes and the limit is {limit}; raise `maxMemoryBytes` or drop a fold range")]
+    BunchingTooBig {
+        fold_players: usize,
+        peak: u64,
+        limit: u64,
+    },
 }
 
 /// How much memory a tree would take, both ways.
@@ -59,8 +97,13 @@ pub struct MemoryEstimate {
     pub uncompressed: u64,
     /// 16-bit integers with a shared scale.
     pub compressed: u64,
-    /// What the built game actually allocated.
+    /// What the built game actually allocated. Includes [`Self::bunching_extra`] when present.
     pub allocated: u64,
+    /// Game-side arena bytes the bunching effect adds, on top of the tree itself. Present
+    /// exactly when the spot asks for bunching; computable from the tree alone, so `estimate`
+    /// reports it without ever touching the referenced data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bunching_extra: Option<u64>,
 }
 
 /// Build the game for a spot, allocate its storage, and pin any requested strategies.
@@ -70,12 +113,58 @@ pub struct MemoryEstimate {
 /// If the spot is invalid, the tree cannot be built, it would need more memory than the spot
 /// allows, or a lock cannot be applied to the tree that was built.
 pub fn build(spot: &Spot) -> Result<(PostFlopGame, MemoryEstimate), EngineError> {
+    build_with_bunching(spot, None)
+}
+
+/// [`build`], with bunching data to apply between the tree build and the allocation — the
+/// engine's canonical ordering (`with_config` → `set_bunching_effect` → `allocate_memory`).
+///
+/// The caller resolves the spot's [`crate::spot::BunchingRef`] to actual data; this function
+/// only applies it. The `TooBig` check inside `construct` already counted the bunching arena
+/// (the spot says whether bunching is coming, and the arena size needs no data), so a game that
+/// gets here fits, arena included.
+///
+/// # Errors
+///
+/// As [`build`], plus the engine's refusals of the data itself: not ready, a flop that does not
+/// match the spot's, or fold ranges that leave no valid combination against this board.
+pub fn build_with_bunching(
+    spot: &Spot,
+    bunching: Option<&BunchingData>,
+) -> Result<(PostFlopGame, MemoryEstimate), EngineError> {
     let (mut game, memory) = construct(spot)?;
+    if let Some(data) = bunching {
+        game.set_bunching_effect(data).map_err(EngineError::Build)?;
+    }
     game.allocate_memory(spot.compress);
     // After allocation (the engine refuses locks before it) and before the CFR loop (it
     // refuses them after `finalize` marks the game solved).
     apply_locks(&mut game, &spot.locks)?;
     Ok((game, memory))
+}
+
+/// Build unprocessed bunching data for a spec, refusing one whose preparation would not fit.
+///
+/// The peak gate has to run *here*, before any phase allocates: the four-fold-player case
+/// mallocs 3.6 GB in one go during phase 2, well past the point of refusing politely.
+///
+/// # Errors
+///
+/// If the spec is invalid (the engine's own message, wrapped in
+/// [`SpotError::Bunching`]) or the preparation's peak exceeds the spec's memory cap.
+pub fn validate_bunching(spec: &BunchingSpec) -> Result<BunchingData, EngineError> {
+    let data = spec.validate()?;
+    let fold_players = data.fold_ranges().len();
+    let peak = PEAK_BUNCHING_BYTES[fold_players - 1];
+    let limit = spec.max_memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
+    if peak > limit {
+        return Err(EngineError::BunchingTooBig {
+            fold_players,
+            peak,
+            limit,
+        });
+    }
+    Ok(data)
 }
 
 /// One failed step of a history replay: `history[depth]` asked for `index` where the node
@@ -248,11 +337,18 @@ fn construct_validated(
     let game = PostFlopGame::with_config(card_config, action_tree).map_err(EngineError::Build)?;
 
     let (uncompressed, compressed) = game.memory_usage();
+    // The bunching arena's size depends only on the tree, not on the data, so the budget check
+    // covers it even though the data has not been resolved yet — and `estimate` can report it
+    // for a spot whose preparation is still queued.
+    let bunching_extra = spot
+        .bunching
+        .is_some()
+        .then(|| game.memory_usage_bunching());
     let needed = if spot.compress {
         compressed
     } else {
         uncompressed
-    };
+    } + bunching_extra.unwrap_or(0);
     let limit = spot.max_memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
     if needed > limit {
         return Err(EngineError::TooBig {
@@ -268,6 +364,7 @@ fn construct_validated(
             uncompressed,
             compressed,
             allocated: needed,
+            bunching_extra,
         },
     ))
 }
@@ -449,6 +546,134 @@ pub fn load(
     path: &str,
     max_memory_bytes: Option<u64>,
 ) -> Result<(PostFlopGame, String), EngineError> {
+    let limit = max_memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
+    postflop_solver::load_data_from_file(path, Some(limit)).map_err(|reason| EngineError::Load {
+        path: path.to_owned(),
+        reason,
+    })
+}
+
+/// Write prepared bunching data to disk, in the engine's own container format.
+///
+/// Same container as a solution (the header's data-type byte tells them apart), so a bunching
+/// file refuses to open as a game and vice versa, cleanly.
+///
+/// # Errors
+///
+/// If the data is not fully processed, or the file cannot be written.
+pub fn save_bunching(
+    data: &BunchingData,
+    path: &str,
+    memo: &str,
+    compression_level: Option<i32>,
+) -> Result<(), EngineError> {
+    postflop_solver::save_data_to_file(data, memo, path, compression_level).map_err(|reason| {
+        EngineError::Save {
+            path: path.to_owned(),
+            reason,
+        }
+    })
+}
+
+/// Re-establish a bunching effect on a game loaded from disk — weights, tables *and* EVs.
+///
+/// `set_bunching_effect` alone is not enough after a load: the file format omits the stored
+/// counterfactual values, and the decoder restores them by re-running `finalize` — necessarily
+/// *before* any bunching effect can be applied, so every stored EV on a freshly loaded game is
+/// a non-bunching evaluation of the saved strategy. (Weights and equity are computed live at
+/// read time, which is why they alone would look correct — the discrepancy is exactly the kind
+/// that survives a casual check.) So after applying the effect, `finalize` runs once more with
+/// bunching evaluation in place. It only *reads* the strategy — never rewrites it — so the
+/// second pass reproduces the pre-save EVs bit for bit; the private `Refinalize` wrapper below
+/// is what gets it past the already-solved refusal, the same state dance the decoder itself
+/// performs.
+///
+/// # Errors
+///
+/// The engine's `set_bunching_effect` refusals: data not ready, a flop that does not match, or
+/// fold ranges leaving no valid combination.
+pub fn reapply_bunching(game: &mut PostFlopGame, data: &BunchingData) -> Result<(), String> {
+    game.set_bunching_effect(data)?;
+    postflop_solver::finalize(&mut Refinalize(game));
+    Ok(())
+}
+
+/// A view of a solved [`PostFlopGame`] that [`postflop_solver::finalize`] will accept again.
+///
+/// Delegates the whole [`Game`] trait except the two solved-state methods: `is_solved` answers
+/// `false` so `finalize` runs, and `set_solved` is a no-op because the inner game already is.
+struct Refinalize<'a>(&'a mut PostFlopGame);
+
+impl postflop_solver::Game for Refinalize<'_> {
+    type Node = postflop_solver::PostFlopNode;
+
+    fn root(&self) -> postflop_solver::MutexGuardLike<'_, Self::Node> {
+        self.0.root()
+    }
+
+    fn num_private_hands(&self, player: usize) -> usize {
+        self.0.num_private_hands(player)
+    }
+
+    fn initial_weights(&self, player: usize) -> &[f32] {
+        self.0.initial_weights(player)
+    }
+
+    fn evaluate(
+        &self,
+        result: &mut [std::mem::MaybeUninit<f32>],
+        node: &Self::Node,
+        player: usize,
+        cfreach: &[f32],
+    ) {
+        self.0.evaluate(result, node, player, cfreach);
+    }
+
+    fn chance_factor(&self, node: &Self::Node) -> usize {
+        self.0.chance_factor(node)
+    }
+
+    fn is_solved(&self) -> bool {
+        false
+    }
+
+    fn set_solved(&mut self) {}
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn is_raked(&self) -> bool {
+        self.0.is_raked()
+    }
+
+    fn isomorphic_chances(&self, node: &Self::Node) -> &[u8] {
+        self.0.isomorphic_chances(node)
+    }
+
+    fn isomorphic_swap(&self, node: &Self::Node, index: usize) -> &[Vec<(u16, u16)>; 2] {
+        self.0.isomorphic_swap(node, index)
+    }
+
+    fn locking_strategy(&self, node: &Self::Node) -> &[f32] {
+        self.0.locking_strategy(node)
+    }
+
+    fn is_compression_enabled(&self) -> bool {
+        self.0.is_compression_enabled()
+    }
+}
+
+/// Read prepared bunching data back, under the same refusal-over-OOM-kill cap as [`load`].
+///
+/// # Errors
+///
+/// If the file is missing, is not bunching data, fails the engine's decode-time validation, or
+/// claims more memory than the cap allows.
+pub fn load_bunching(
+    path: &str,
+    max_memory_bytes: Option<u64>,
+) -> Result<(BunchingData, String), EngineError> {
     let limit = max_memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
     postflop_solver::load_data_from_file(path, Some(limit)).map_err(|reason| EngineError::Load {
         path: path.to_owned(),
