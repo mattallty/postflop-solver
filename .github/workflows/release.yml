@@ -33,8 +33,10 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
-      # One platform failing should not deprive the release of the others; the digests are
-      # collected at the end and a missing one is visible there.
+      # fail-fast off so that one platform failing does not cancel the other builds mid-run —
+      # their logs and artifacts stay available for diagnosis. The release itself is still
+      # all-or-nothing: `publish` needs every leg, so a failed platform blocks publishing
+      # rather than shipping a release with that platform silently missing from SHA256SUMS.
       fail-fast: false
       matrix:
         include:
@@ -55,7 +57,14 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm
     steps:
+      # A manual dispatch must build the tag it will publish, not whatever ref it was
+      # dispatched from: without this, re-running the workflow for `sidecar-v0.1.0` from main
+      # would attach artifacts built from main's HEAD — and their digests — to that tag's
+      # release, breaking the guarantee that a rebuild of a tag reproduces its artifacts. On a
+      # tag push `inputs.tag` is empty and this falls through to the pushed ref itself.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install the toolchain for ${{ matrix.target }}
         run: |
@@ -67,9 +76,12 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # Every host here builds its own architecture, so this is never a cross-compile. That
-      # matters for more than tidiness: `zstd-sys` compiles C, and a native build needs no
-      # cross toolchain and no linker configuration to get wrong.
+      # Every host here builds its own architecture — except x86_64-apple-darwin, which
+      # macos-latest (an arm64 runner) cross-compiles; Apple's toolchain ships both targets in
+      # one SDK, so it needs no extra toolchain, and the smoke check below still runs the
+      # result, under Rosetta 2. Everywhere else nativeness matters for more than tidiness:
+      # `zstd-sys` compiles C, and a native build needs no cross toolchain and no linker
+      # configuration to get wrong.
       - name: Build
         run: cargo build --release --locked -p pkwiz-solver --target ${{ matrix.target }}
 
