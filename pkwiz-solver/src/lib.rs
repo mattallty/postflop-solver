@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 pub use engine::{EngineError, MemoryEstimate, Sample, Solved, Stopped, DEFAULT_MEMORY_LIMIT};
 pub use jobs::{Emit, JobError, JobId, JobStatus, Jobs, NodeView, Phase, Silent};
 pub use protocol::{execute, Command, OpError, PROTOCOL_VERSION};
-pub use spot::{BoardSpec, RangeSpec, Sizing, Spot, SpotError, Stop, StreetSizing};
+pub use spot::{BoardSpec, Lock, RangeSpec, Sizing, Spot, SpotError, Stop, StreetSizing};
 
 /// One request line.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

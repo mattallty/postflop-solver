@@ -485,3 +485,35 @@ fn forget_over_the_wire_removes_the_job() {
     assert_eq!(after["ok"], false);
     assert_eq!(after["error"]["code"], "no_such_job");
 }
+
+#[test]
+fn a_node_response_carries_ev_detail_and_lock_state_in_camel_case() {
+    let (session, _) = session();
+    let queued = call(
+        &session,
+        &format!(r#"{{"id":1,"cmd":"solve","spot":{SPOT}}}"#),
+    );
+    let id = queued["result"]["jobId"].as_u64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let v = call(&session, &format!(r#"{{"cmd":"progress","jobId":{id}}}"#));
+        if v["result"]["phase"] == "done" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "job never finished: {v}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let node = call(
+        &session,
+        &format!(r#"{{"id":2,"cmd":"node","jobId":{id}}}"#),
+    );
+    let result = &node["result"];
+    // The wire names, pinned: camelCase, present, and shaped like `strategy`.
+    assert_eq!(
+        result["evDetail"].as_array().unwrap().len(),
+        result["actions"].as_array().unwrap().len()
+    );
+    assert_eq!(result["isLocked"], false);
+}

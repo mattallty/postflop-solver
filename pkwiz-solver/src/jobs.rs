@@ -487,6 +487,9 @@ impl Jobs {
             save_path: None,
             compression_level: crate::spot::Spot::default_compression_level(),
             memo: Some(memo),
+            // A reopened file's locks live in the game itself (the engine serializes them);
+            // this placeholder spot is never used to rebuild.
+            locks: Vec::new(),
         };
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
@@ -838,6 +841,21 @@ pub struct NodeView {
     pub equity: Vec<f32>,
     /// Expected value of each hand at this node.
     pub ev: Vec<f32>,
+    /// Expected value of each action of each of the acting player's hands, before the
+    /// strategy is applied: `ev_detail[a][h]` is what hand `h` makes by taking action `a`
+    /// (same units and perspective as [`Self::ev`], which is the strategy-weighted average of
+    /// these rows). Rows are in [`Self::actions`] order, exactly like [`Self::strategy`].
+    ///
+    /// Two engine conventions surface here: a `Fold` row is exactly `0.0` for every hand (the
+    /// engine's fold-EV convention, not a computed value), and a hand with zero normalized
+    /// weight is `0.0` in every row. Empty at a terminal or chance node.
+    #[serde(default)]
+    pub ev_detail: Vec<Vec<f32>>,
+    /// Whether any hand's strategy is pinned at this node (see `Spot::locks`). Always `false`
+    /// at terminal and chance nodes. On a locked node, [`Self::strategy`] already shows the
+    /// pinned frequencies — the engine applies the lock overlay at read time.
+    #[serde(default)]
+    pub is_locked: bool,
     /// Range-weighted averages of the two arrays above — the numbers a header line shows.
     ///
     /// `null` at a terminal or chance node, where there is no acting player to average over.
@@ -849,35 +867,12 @@ pub struct NodeView {
 }
 
 fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, JobError> {
-    game.back_to_root();
-    for (depth, index) in history.iter().enumerate() {
-        if game.is_terminal_node() {
-            return Err(JobError::BadHistory {
-                index: *index,
-                available: 0,
-            });
-        }
-        if game.is_chance_node() {
-            // At a chance node the "action" is the dealt card id, not an offset into a list.
-            let mask = game.possible_cards();
-            if *index >= 52 || mask & (1u64 << *index) == 0 {
-                return Err(JobError::BadHistory {
-                    index: *index,
-                    available: mask.count_ones() as usize,
-                });
-            }
-        } else {
-            let available = game.available_actions().len();
-            if *index >= available {
-                return Err(JobError::BadHistory {
-                    index: *index,
-                    available,
-                });
-            }
-        }
-        let _ = depth;
-        game.play(*index);
-    }
+    // The same validated replay `apply_locks` uses; at a chance node the "action" is the dealt
+    // card id, not an offset into a list.
+    engine::walk(game, history).map_err(|step| JobError::BadHistory {
+        index: step.index,
+        available: step.available,
+    })?;
 
     let is_terminal = game.is_terminal_node();
     let is_chance = game.is_chance_node();
@@ -913,6 +908,8 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
             weights: Vec::new(),
             equity: Vec::new(),
             ev: Vec::new(),
+            ev_detail: Vec::new(),
+            is_locked: false,
             average_equity: None,
             average_ev: None,
         });
@@ -934,6 +931,13 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
     let weights = game.normalized_weights(player).to_vec();
     let equity = game.equity(player);
     let ev = game.expected_values(player);
+    // Chunked exactly like `strategy` above so the two matrices can never disagree on width.
+    let ev_detail: Vec<Vec<f32>> = game
+        .expected_values_detail(player)
+        .chunks(num_hands.max(1))
+        .map(<[f32]>::to_vec)
+        .collect();
+    let is_locked = game.current_locking_strategy().is_some();
     let average_equity = Some(postflop_solver::compute_average(&equity, &weights));
     let average_ev = Some(postflop_solver::compute_average(&ev, &weights));
 
@@ -949,6 +953,8 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
         weights,
         equity,
         ev,
+        ev_detail,
+        is_locked,
         average_equity,
         average_ev,
     })

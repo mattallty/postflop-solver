@@ -311,6 +311,44 @@ pub struct Spot {
     /// Free-text note stored alongside a saved solution — the hand id it came from, typically.
     #[serde(default)]
     pub memo: Option<String>,
+    /// Strategies to pin before the CFR loop.
+    ///
+    /// Applied to the freshly built tree, in order, after memory allocation and before
+    /// iteration 0; the solver then optimizes everything else *against* the pinned play.
+    /// Empty means none. See [`Lock`] for the layout contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locks: Vec<Lock>,
+}
+
+/// Pin (part of) the acting player's strategy at one node before the solve.
+///
+/// The engine's semantics, which the wire inherits: a hand whose column is all zeros is left
+/// **free** for the solver; a hand with any positive entry is **locked**, and the engine
+/// normalizes its column to sum 1 (so the values need not sum to 1 themselves). Locking a node
+/// below an isomorphism-eliminated chance card works — the engine converts the strategy into
+/// storage coordinates itself — and locking the same storage node twice is last-write-wins.
+///
+/// A history that does not reach a decision node, a strategy of the wrong dimensions, or a
+/// `hands` guard that does not match fails the **job** (`phase: "failed"`, the reason in
+/// `error`): those need the built tree to check. Everything checkable from the request alone
+/// fails the `solve` command synchronously.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lock {
+    /// Action indices from the root — the `node` command's convention exactly: at a chance
+    /// node the index is the dealt card's id (0–51). Empty means the root.
+    #[serde(default)]
+    pub history: Vec<usize>,
+    /// Action-major, `NodeView.strategy`'s shape at that node: `strategy[a][h]`. Rows are the
+    /// node's actions in `NodeView.actions` order; columns are the acting player's hands in
+    /// `NodeView.hands` order (positive-weight combos, `(low, high)` pairs, lexicographic).
+    /// Values must be finite and non-negative.
+    pub strategy: Vec<Vec<f32>>,
+    /// Optional guard against hand-order mistakes: if present, must equal the acting player's
+    /// hand list at that node (`"QsQh"` style, highest card first), checked entry-by-entry
+    /// before the lock is applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hands: Option<Vec<String>>,
 }
 
 impl Spot {
@@ -340,6 +378,7 @@ impl Spot {
             save_path: None,
             compression_level: default_compression_level(),
             memo: None,
+            locks: Vec::new(),
         }
     }
 
@@ -417,6 +456,45 @@ impl Spot {
             merging_threshold: self.sizing.merging_threshold,
         };
 
+        // The syntactic half of lock validation — everything checkable without a tree fails
+        // the command here; the structural half (does the history reach a decision node with
+        // these dimensions?) runs in the worker and fails the job.
+        for (index, lock) in self.locks.iter().enumerate() {
+            let err = |reason: &str| SpotError::Lock {
+                index,
+                reason: reason.to_owned(),
+            };
+            let Some(first_row) = lock.strategy.first() else {
+                return Err(err("`strategy` needs at least one action row"));
+            };
+            if first_row.is_empty() {
+                return Err(err("`strategy` rows need at least one hand column"));
+            }
+            if lock.strategy.iter().any(|row| row.len() != first_row.len()) {
+                return Err(err(
+                    "every `strategy` row must have the same number of hands",
+                ));
+            }
+            if lock
+                .strategy
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            {
+                return Err(err("`strategy` values must be finite and non-negative"));
+            }
+            if let Some(hands) = &lock.hands {
+                if hands.len() != first_row.len() {
+                    return Err(err(
+                        "`hands` must have exactly one entry per `strategy` column",
+                    ));
+                }
+            }
+            if lock.history.contains(&usize::MAX) {
+                return Err(err("`history` entries must be explicit indices"));
+            }
+        }
+
         Ok(Validated {
             board,
             oop,
@@ -468,6 +546,8 @@ pub enum SpotError {
     Amount { field: &'static str, reason: String },
     #[error("the {player} range has no combinations left once the board is removed")]
     EmptyRange { player: &'static str },
+    #[error("`locks[{index}]` is invalid: {reason}")]
+    Lock { index: usize, reason: String },
 }
 
 #[cfg(test)]
