@@ -51,7 +51,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// its own, and bumping the engine revision for a protocol change would be a lie in the other
 /// direction — a host that keys "can I open this file?" on an exact match would mark a whole
 /// library of saved solves unreadable for a change that never touched the engine.
-pub const ENGINE_REV: &str = "5e3de32ad2cf848b6a33db4a2a806e5f8dca7f51";
+pub const ENGINE_REV: &str = "dbece54786442ebd47bd034031e92d076ea282a4";
 
 /// The version string the engine stamps into every solution it writes.
 ///
@@ -71,22 +71,27 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// to be *earned*: same [`ENGINE_FORMAT`], same storage layout, verified by writing the same spot
 /// with both builds and comparing the files.
 ///
-/// This list is why the pin can move at all — it has moved three times in two days, never once for
-/// a reason that touched the format. Every earlier revision stays on it, so a tree saved before any
-/// of those bumps is still offered rather than greyed out:
+/// This list is why the pin can move at all — it has never once moved for a reason that touched
+/// the format. Every earlier revision stays on it, so a tree saved before any of those bumps is
+/// still offered rather than greyed out:
 ///
+/// - `5e3de32` — [PR #6](https://github.com/mattallty/postflop-solver/pull/6): `visit`
+///   robustness and its tests. The current head sits on top of it and touches only the `visit`
+///   traversal, `free_memory`, and the node accessors — nothing the file format passes through.
 /// - `b97e0bd` — [PR #3](https://github.com/mattallty/postflop-solver/pull/3): docs, CI and the
-///   MSRV declaration. `5e3de32` ([PR #6](https://github.com/mattallty/postflop-solver/pull/6))
-///   sits on top of it and touches only `visit` and its tests.
+///   MSRV declaration.
 /// - `7c64831` — [PR #2](https://github.com/mattallty/postflop-solver/pull/2): tree visitor,
 ///   `free_memory`, CI lints.
 /// - `6f485ef` — [PR #1](https://github.com/mattallty/postflop-solver/pull/1): the bincode 2.0
 ///   migration. What every solution saved before 2026-08-02 was written by.
 ///
-/// Verified 2026-08-02, for each of the four: the same spot saved by every pair of builds is
-/// byte-identical, and each opens the others' files with identical node output.
+/// Verified 2026-08-02, for the first four: the same spot saved by every pair of builds is
+/// byte-identical, and each opens the others' files with identical node output. Verified
+/// 2026-08-06 for `5e3de32` against the current head the same way: the same solved turn spot,
+/// saved twice by each build, produced one identical file all four times.
 pub const ENGINE_COMPATIBLE_REVS: &[&str] = &[
     ENGINE_REV,
+    "5e3de32ad2cf848b6a33db4a2a806e5f8dca7f51",
     "b97e0bd464a8297c6476cad63b1ddb792d69bc34",
     "7c64831363519d9e34db7589ee2d8f20367801e8",
     "6f485efcbc08744c3875748d7e3750a773e1075d",
