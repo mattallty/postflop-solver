@@ -162,15 +162,15 @@ fn a_tree_with_no_betting_is_solved_before_it_starts() {
     let oop = jobs.node(done.job_id, &[]).unwrap();
     assert_eq!(oop.player, Some(0));
     assert!(
-        (oop.average_equity - 0.5).abs() < 1e-4,
+        (oop.average_equity.unwrap() - 0.5).abs() < 1e-4,
         "{}",
-        oop.average_equity
+        oop.average_equity.unwrap()
     );
     // The whole tree is one action for each player.
     assert_eq!(oop.actions, ["Check"]);
     let ip = jobs.node(done.job_id, &[0]).unwrap();
     assert_eq!(ip.player, Some(1));
-    assert!((ip.average_equity - 0.5).abs() < 1e-4);
+    assert!((ip.average_equity.unwrap() - 0.5).abs() < 1e-4);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn a_board_that_chops_every_hand_forces_the_answer() {
     );
 
     let root = jobs.node(done.job_id, &[]).unwrap();
-    assert!((root.average_equity - 0.5).abs() < 1e-4);
+    assert!((root.average_equity.unwrap() - 0.5).abs() < 1e-4);
     // Every single hand, not just the average.
     assert!(
         root.equity.iter().all(|e| (e - 0.5).abs() < 1e-4),
@@ -825,4 +825,25 @@ fn a_terminal_frame_is_final_even_when_cancel_races_the_worker() {
     }
     // Every job ended exactly once.
     assert_eq!(terminal.len(), ids.len());
+}
+
+#[test]
+fn a_job_cancelled_while_queued_says_so_when_read() {
+    let jobs = Jobs::new(Arc::new(Silent));
+    // The first job occupies the single worker; the second is cancelled while still queued, so
+    // it never produces a game or a file.
+    let first = jobs
+        .submit(river("2c7dTh4sQd", "QQ+,AKs,76s", 200_000))
+        .unwrap();
+    let second = jobs.submit(river("2c7dTh4sQd", "QQ+", 200_000)).unwrap();
+    jobs.cancel(second.job_id).unwrap();
+
+    // Not the old self-contradiction ("is Cancelled; … can only be read once it has finished
+    // or been cancelled") — a distinct answer a host can branch on.
+    let err = jobs.node(second.job_id, &[]).unwrap_err();
+    assert_eq!(err, JobError::NeverRan(second.job_id));
+    assert_eq!(err.code(), "never_ran");
+
+    jobs.cancel(first.job_id).unwrap();
+    finish(&jobs, first.job_id, Duration::from_secs(10));
 }

@@ -88,7 +88,8 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorBody {
     /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`, `engine`,
-    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `serialize`, or `panic`.
+    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `never_ran`, `serialize`, or
+    /// `panic`.
     pub code: String,
     pub message: String,
 }

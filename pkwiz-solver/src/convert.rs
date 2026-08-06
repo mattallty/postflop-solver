@@ -57,6 +57,12 @@ pub fn from_engine_card(card: EngineCard) -> Result<PkCard, String> {
 ///
 /// As [`from_engine_card`], or if the two cards are the same.
 pub fn hole_to_string(hole: (EngineCard, EngineCard)) -> Result<String, String> {
+    if hole.0 == hole.1 {
+        return Err(format!(
+            "hole cards are the same card (id {}), which no deck deals",
+            hole.0
+        ));
+    }
     let (a, b) = (from_engine_card(hole.0)?, from_engine_card(hole.1)?);
     // Higher card first, which is how both the engine and our own `Combo` render a hand.
     let (hi, lo) = if a.index() >= b.index() {

@@ -210,6 +210,8 @@ pub enum JobError {
     NotRecoverable(JobId),
     #[error("job {id} is {phase:?}; it can only be forgotten once it is finished, cancelled, or failed — cancel it first")]
     NotFinished { id: JobId, phase: Phase },
+    #[error("job {0} was cancelled before it started; it never produced a strategy")]
+    NeverRan(JobId),
     #[error("{0}")]
     Engine(#[from] EngineError),
     #[error("action index {index} is out of range at that node, which offers {available}")]
@@ -228,6 +230,7 @@ impl JobError {
             Self::NothingToSave(_) => "nothing_to_save",
             Self::NotRecoverable(_) => "not_recoverable",
             Self::NotFinished { .. } => "not_finished",
+            Self::NeverRan(_) => "never_ran",
             Self::Engine(_) => "engine",
             Self::BadHistory { .. } | Self::NoStrategy { .. } => "bad_node",
         }
@@ -535,7 +538,12 @@ impl Jobs {
         if guard.is_none() {
             // Released, or never published. Only the first is recoverable. The reload honours
             // the same memory cap the job was allowed when it was built or opened.
-            let path = saved_to.ok_or(JobError::NotReadable { id, phase })?;
+            // No game and no file: a job cancelled while still queued. (`Done` always has one
+            // or the other — the worker publishes the game before flipping the phase, and
+            // `release` refuses to drop an unsaved one.) The old `NotReadable` here produced a
+            // self-contradicting message: "is Cancelled; … can only be read once it has
+            // finished or been cancelled".
+            let path = saved_to.ok_or(JobError::NeverRan(id))?;
             *guard = Some(engine::load(&path, job.spot.max_memory_bytes)?.0);
             // The status is updated while the game guard is still held: dropping it first
             // would let `release_others` (from a concurrent `open`, or a solve starting) take
@@ -550,6 +558,14 @@ impl Jobs {
     }
 
     /// Stop the worker after the job it is on. Idempotent.
+    ///
+    /// "After the job it is on" is the library's half of the story; what happens to that job
+    /// depends on who is embedding this. The binary exits right after answering the `shutdown`
+    /// command, killing the detached worker mid-solve — an in-flight job is abandoned, and a
+    /// `savePath` it was queued with is never written. Queued jobs simply never run, and no
+    /// terminal frame is emitted for either kind. A host that wants the in-flight solve kept
+    /// should `cancel` it and wait for its terminal frame before shutting down: a cancelled
+    /// solve is still finalized and, if it asked for one, saved.
     pub fn shutdown(&self) {
         self.shared.stopping.store(true, Ordering::Relaxed);
         self.shared.wake.notify_all();
@@ -797,6 +813,11 @@ fn fail(shared: &Arc<Shared>, job: &Arc<Job>, started: Instant, message: String)
 #[serde(rename_all = "camelCase")]
 pub struct NodeView {
     /// The action indices that were replayed to get here.
+    ///
+    /// **At a chance node the index is the dealt card's id (0–51), not a position in
+    /// [`Self::actions`].** A host that walks the tree by enumerating `actions` and sending
+    /// positions will be right at every decision node and wrong at exactly the chance nodes;
+    /// parse the card out of the rendered `Chance(..)` entry instead.
     pub history: Vec<usize>,
     /// The board at this node, which grows as chance nodes are played through.
     pub board: Vec<String>,
@@ -818,8 +839,13 @@ pub struct NodeView {
     /// Expected value of each hand at this node.
     pub ev: Vec<f32>,
     /// Range-weighted averages of the two arrays above — the numbers a header line shows.
-    pub average_equity: f32,
-    pub average_ev: f32,
+    ///
+    /// `null` at a terminal or chance node, where there is no acting player to average over.
+    /// (These were previously `f32::NAN` internally, which serde_json also writes as `null` —
+    /// the wire shape is unchanged; the type now says so, and the struct can deserialize its
+    /// own output.)
+    pub average_equity: Option<f32>,
+    pub average_ev: Option<f32>,
 }
 
 fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, JobError> {
@@ -887,8 +913,8 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
             weights: Vec::new(),
             equity: Vec::new(),
             ev: Vec::new(),
-            average_equity: f32::NAN,
-            average_ev: f32::NAN,
+            average_equity: None,
+            average_ev: None,
         });
     }
 
@@ -908,8 +934,8 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
     let weights = game.normalized_weights(player).to_vec();
     let equity = game.equity(player);
     let ev = game.expected_values(player);
-    let average_equity = postflop_solver::compute_average(&equity, &weights);
-    let average_ev = postflop_solver::compute_average(&ev, &weights);
+    let average_equity = Some(postflop_solver::compute_average(&equity, &weights));
+    let average_ev = Some(postflop_solver::compute_average(&ev, &weights));
 
     Ok(NodeView {
         history: history.to_vec(),

@@ -160,6 +160,11 @@ pub enum Command {
     #[serde(rename = "version")]
     Version,
     /// End the session. The response is sent before the process exits.
+    ///
+    /// Abrupt by design: an in-flight solve is abandoned mid-iteration (its `savePath`, if any,
+    /// is never written) and queued jobs never run — neither gets a terminal frame. A host that
+    /// wants the running solve kept should `cancel` it and wait for its terminal frame first; a
+    /// cancelled solve is still finalized and saved.
     #[serde(rename = "shutdown")]
     Shutdown,
 }
