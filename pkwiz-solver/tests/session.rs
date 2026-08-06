@@ -207,11 +207,13 @@ fn releasing_a_tree_over_the_wire_keeps_the_job_and_its_numbers() {
         .unwrap();
 
     // Wait for it, then write it out — a job with no file behind it cannot be released.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let done = loop {
         let v = call(&session, &format!(r#"{{"cmd":"progress","jobId":{id}}}"#));
         if v["result"]["phase"] == "done" {
             break v;
         }
+        assert!(Instant::now() < deadline, "job never finished: {v}");
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
     assert_eq!(done["result"]["resident"], true);
