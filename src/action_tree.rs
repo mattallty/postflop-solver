@@ -830,6 +830,21 @@ impl ActionTree {
             _ => action,
         };
 
+        // The rewrite can land on an action the node already offers: adding `Bet(max_amount)`
+        // where `AllIn(max_amount)` exists is a duplicate, and the insertion index computed for
+        // the pre-rewrite action would both insert it anyway — two identical all-in children,
+        // with strategy split across them — and break the sorted order of `actions` that every
+        // binary search here relies on. So search again for what will actually be inserted.
+        let search_result = if is_replaced {
+            let rewritten = node.actions.binary_search(&action);
+            if rewritten.is_ok() {
+                return Err(format!("Action already exists: {action:?}"));
+            }
+            rewritten
+        } else {
+            search_result
+        };
+
         let is_valid_bet = match action {
             Action::Bet(amount) if amount >= min_amount && amount < max_amount => {
                 matches!(
@@ -1092,4 +1107,78 @@ fn merge_bet_actions(actions: Vec<Action>, pot: i32, offset: i32, param: f64) ->
 
     ret.reverse();
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flop tree whose 200%-pot bet threshold turns `Bet(200)` into `AllIn(200)`: pot 100,
+    /// stack 200, one 50% bet size, and an all-in threshold generous enough that the automatic
+    /// tree already offers the all-in.
+    fn tree_with_allin() -> ActionTree {
+        let config = TreeConfig {
+            starting_pot: 100,
+            effective_stack: 200,
+            add_allin_threshold: 10.0,
+            flop_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            ..Default::default()
+        };
+        ActionTree::new(config).unwrap()
+    }
+
+    #[test]
+    fn add_line_refuses_a_max_bet_where_the_allin_already_exists() {
+        let mut tree = tree_with_allin();
+        let before = tree.available_actions().to_vec();
+        assert!(
+            before.contains(&Action::AllIn(200)),
+            "the automatic tree offers the all-in: {before:?}"
+        );
+
+        // `Bet(200)` is rewritten to `AllIn(200)`, which already exists. Accepting it inserted
+        // a second identical all-in — at `Bet`'s sort position, additionally breaking the
+        // sorted order the action lookups rely on — and the solver then split its strategy
+        // across two indistinguishable children.
+        let result = tree.add_line(&[Action::Bet(200)]);
+        assert!(result.is_err(), "duplicate all-in was accepted");
+        assert_eq!(tree.available_actions(), before);
+        assert!(tree.added_lines().is_empty());
+    }
+
+    #[test]
+    fn add_line_still_rewrites_a_max_bet_into_a_new_allin() {
+        // With the automatic all-in disabled, the rewrite has nothing to collide with and must
+        // keep working as before.
+        let config = TreeConfig {
+            starting_pot: 100,
+            effective_stack: 200,
+            add_allin_threshold: 0.0,
+            flop_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(config).unwrap();
+        let before = tree.available_actions().to_vec();
+        assert!(!before.contains(&Action::AllIn(200)), "{before:?}");
+
+        tree.add_line(&[Action::Bet(200)]).unwrap();
+        let actions = tree.available_actions().to_vec();
+        assert_eq!(
+            actions.iter().filter(|a| **a == Action::AllIn(200)).count(),
+            1,
+            "{actions:?}"
+        );
+        // Inserted at the all-in's own sort position, so the ordered lookups stay valid.
+        let mut sorted = actions.clone();
+        sorted.sort_unstable();
+        assert_eq!(actions, sorted);
+        // Recorded as the all-in it became, not the bet it was written as.
+        assert_eq!(tree.added_lines(), [vec![Action::AllIn(200)]]);
+    }
 }

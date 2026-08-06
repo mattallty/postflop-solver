@@ -269,7 +269,10 @@ impl PostFlopGame {
                 panic!("Storage mode is not compatible");
             }
 
-            node.children().iter().map(|c| c.lock().prev_action).collect()
+            node.children()
+                .iter()
+                .map(|c| c.lock().prev_action)
+                .collect()
         }
     }
 
