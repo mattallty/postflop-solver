@@ -244,7 +244,12 @@ impl PostFlopGame {
     /// turn/river node and not a terminal, isomorphic chances are grouped into one representative
     /// action (in most cases, you should use the [`possible_cards`] method).
     ///
+    /// Panics if the game was loaded from a file saved with a reduced storage mode (see
+    /// [`set_target_storage_mode`]) and the current node is a chance node at the storage
+    /// boundary: the children belong to the street that was not saved.
+    ///
     /// [`possible_cards`]: #method.possible_cards
+    /// [`set_target_storage_mode`]: #method.set_target_storage_mode
     #[inline]
     pub fn available_actions(&self) -> Vec<Action> {
         if self.state <= State::Uninitialized {
@@ -254,11 +259,17 @@ impl PostFlopGame {
         if self.is_terminal_node() {
             Vec::new()
         } else {
-            self.node()
-                .children()
-                .iter()
-                .map(|c| c.lock().prev_action)
-                .collect()
+            // A game saved with a reduced storage mode has its node arena truncated at the
+            // street boundary, so the boundary chance nodes' child metadata points past its
+            // end. Refuse rather than read out of bounds.
+            let node = self.node();
+            let children_end =
+                self.node_index(&node) + node.children_offset as usize + node.num_children as usize;
+            if children_end > self.node_arena.len() {
+                panic!("Storage mode is not compatible");
+            }
+
+            node.children().iter().map(|c| c.lock().prev_action).collect()
         }
     }
 

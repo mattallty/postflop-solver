@@ -354,9 +354,24 @@ impl PostFlopGame {
     }
 
     /// Allocates the memory.
+    ///
+    /// Panics if the game was loaded from a file saved with a reduced storage mode (see
+    /// [`set_target_storage_mode`]): the node arena is truncated at the street boundary, so
+    /// there is no tree to allocate storage for beyond it. Rebuild the game from its
+    /// configuration instead.
+    ///
+    /// [`set_target_storage_mode`]: #method.set_target_storage_mode
     pub fn allocate_memory(&mut self, enable_compression: bool) {
         if self.state <= State::Uninitialized {
             panic!("Game is not successfully initialized");
+        }
+
+        // Without this check, the freshly allocated game would claim `storage_mode == River`
+        // over an arena that lacks the truncated streets' nodes, and the solver would traverse
+        // out of its bounds.
+        let total_num_nodes = self.num_nodes.iter().sum::<u64>();
+        if (self.node_arena.len() as u64) < total_num_nodes {
+            panic!("Game tree is partially loaded (reduced storage mode)");
         }
 
         if self.state == State::MemoryAllocated

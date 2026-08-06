@@ -1,6 +1,7 @@
 // [File format]
 // The file consists of a header and a body. The header is as follows:
-//  - Magic number (4 bytes): 90 57 f1 09
+//  - Magic number (5 bytes): fc 90 57 f1 09
+//    (the `u32` 0x09f15790 in `VarIntEncoding`: the fc marker, then the value little-endian)
 //  - Version number (1 byte): 1
 //  - Compression type (1 byte): 0 (none), 1 (zstd)
 //  - Data type (1 byte): 0 (game), 1 (bunching)

@@ -1663,6 +1663,65 @@ fn visit_below_isomorphism_eliminated_turn_card() {
     assert_eq!(num_nodes, num_nodes_representative);
 }
 
+/// Builds a solved turn game, saves it with `BoardState::Turn` storage, and loads it back,
+/// yielding a game whose node arena is truncated at the river deal.
+fn truncated_turn_game() -> PostFlopGame {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: 60,
+        effective_stack: 60,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    let mut buf = Vec::new();
+    game.set_target_storage_mode(BoardState::Turn).unwrap();
+    save_data_into_std_write(&game, "", &mut buf, None).unwrap();
+    let (truncated, _): (PostFlopGame, String) =
+        load_data_from_std_read(&mut buf.as_slice(), None).unwrap();
+    truncated
+}
+
+#[test]
+#[should_panic(expected = "Storage mode is not compatible")]
+fn available_actions_panics_at_truncated_storage_boundary() {
+    let mut game = truncated_turn_game();
+
+    // check/check to the chance node that would deal the river
+    game.play(0);
+    game.play(0);
+    assert!(game.is_chance_node());
+
+    // its children are the river nodes the save dropped, so reading them would run past the
+    // end of the node arena
+    game.available_actions();
+}
+
+#[test]
+#[should_panic(expected = "partially loaded")]
+fn allocate_memory_rejects_partially_loaded_game() {
+    let mut game = truncated_turn_game();
+
+    // allocating over the truncated arena would claim the missing streets are present and let
+    // the solver traverse out of its bounds
+    game.allocate_memory(false);
+}
+
 #[test]
 fn node_storage_accessors_tolerate_unallocated_memory() {
     let card_config = CardConfig {
