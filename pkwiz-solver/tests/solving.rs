@@ -54,6 +54,8 @@ fn river(board: &str, range: &str, iterations: u32) -> Spot {
         save_path: None,
         compression_level: Spot::default_compression_level(),
         memo: None,
+        added_lines: Vec::new(),
+        removed_lines: Vec::new(),
         locks: Vec::new(),
     }
 }
@@ -672,6 +674,8 @@ fn a_realistic_flop_solve() {
         save_path: None,
         compression_level: Spot::default_compression_level(),
         memo: None,
+        added_lines: Vec::new(),
+        removed_lines: Vec::new(),
         locks: Vec::new(),
     };
 
@@ -1001,4 +1005,147 @@ fn a_fold_row_is_exactly_zero_and_empty_nodes_have_no_detail() {
     assert!(terminal.is_terminal);
     assert!(terminal.ev_detail.is_empty());
     assert!(!terminal.is_locked);
+}
+
+#[test]
+fn an_added_line_shows_up_in_the_node_and_growss_the_estimate() {
+    let base = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    let mut edited = base.clone();
+    edited.added_lines = vec!["Bet(75)".to_owned()];
+
+    let plain = pkwiz_solver::engine::estimate(&base).unwrap();
+    let bigger = pkwiz_solver::engine::estimate(&edited).unwrap();
+    assert!(
+        bigger.allocated > plain.allocated,
+        "{} vs {}",
+        bigger.allocated,
+        plain.allocated
+    );
+
+    let (jobs, done) = solve(edited);
+    assert_eq!(done.phase, Phase::Done, "{:?}", done.error);
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    assert!(
+        root.actions.iter().any(|a| a == "Bet(75)"),
+        "{:?}",
+        root.actions
+    );
+    assert_eq!(root.strategy.len(), root.actions.len());
+}
+
+#[test]
+fn a_removed_line_disappears_and_shrinks_the_tree() {
+    let base = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    let (jobs, done) = solve(base.clone());
+    let before = jobs.node(done.job_id, &[]).unwrap();
+    let bet = before
+        .actions
+        .iter()
+        .find(|a| a.starts_with("Bet"))
+        .expect("the default tree offers a bet")
+        .clone();
+
+    let mut edited = base.clone();
+    edited.removed_lines = vec![bet.clone()];
+    assert!(
+        pkwiz_solver::engine::estimate(&edited).unwrap().allocated
+            < pkwiz_solver::engine::estimate(&base).unwrap().allocated
+    );
+
+    let (jobs, done) = solve(edited);
+    assert_eq!(done.phase, Phase::Done, "{:?}", done.error);
+    let after = jobs.node(done.job_id, &[]).unwrap();
+    assert!(!after.actions.contains(&bet), "{:?}", after.actions);
+}
+
+#[test]
+fn bad_edits_fail_the_command_synchronously_and_name_the_line() {
+    let jobs = Jobs::new(Arc::new(Silent));
+
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    spot.removed_lines = vec!["Bet(999)".to_owned()];
+    let err = jobs.submit(spot).unwrap_err().to_string();
+    assert!(
+        err.contains("cannot remove the line `Bet(999)`") && err.contains("does not exist"),
+        "{err}"
+    );
+
+    for (line, needle) in [
+        ("Bet(banana)", "not an amount"),
+        ("Chance(Qc)", "chance actions are omitted"),
+        ("", "at least one action"),
+    ] {
+        let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+        spot.added_lines = vec![line.to_owned()];
+        let err = jobs.submit(spot).unwrap_err().to_string();
+        assert!(err.contains(needle), "`{line}`: {err}");
+    }
+
+    assert!(jobs.list().is_empty(), "no job rows were created");
+}
+
+#[test]
+fn removing_every_action_at_a_node_is_refused_with_its_path() {
+    let mut spot = river("2c7dTh4sQd", "QQ+", 30);
+    let (jobs, done) = solve(spot.clone());
+    let root = jobs.node(done.job_id, &[]).unwrap();
+
+    // Remove everything the root offers; the engine would silently accept it and only the
+    // game constructor would refuse, namelessly. The sidecar names the node instead.
+    spot.removed_lines = root.actions.clone();
+    let jobs = Jobs::new(Arc::new(Silent));
+    let err = jobs.submit(spot).unwrap_err().to_string();
+    assert!(
+        err.contains("no actions") && err.contains("(root)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn adds_apply_before_removes_so_a_default_line_under_an_added_bet_can_be_pruned() {
+    // First learn what the engine builds under an added bet.
+    let mut probe = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    probe.added_lines = vec!["Bet(75)".to_owned()];
+    let (jobs, done) = solve(probe.clone());
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    let bet_index = root.actions.iter().position(|a| a == "Bet(75)").unwrap();
+    let under = jobs.node(done.job_id, &[bet_index]).unwrap();
+    let raise = under
+        .actions
+        .iter()
+        .find(|a| a.starts_with("Raise") || a.starts_with("AllIn"))
+        .expect("the added bet's subtree got a raise-family action")
+        .clone();
+
+    // Now prune that default raise inside the same request that adds the bet.
+    let mut edited = probe;
+    edited.removed_lines = vec![format!("Bet(75), {raise}")];
+    let (jobs, done) = solve(edited);
+    assert_eq!(done.phase, Phase::Done, "{:?}", done.error);
+    let root = jobs.node(done.job_id, &[]).unwrap();
+    let bet_index = root.actions.iter().position(|a| a == "Bet(75)").unwrap();
+    let under = jobs.node(done.job_id, &[bet_index]).unwrap();
+    assert!(!under.actions.contains(&raise), "{:?}", under.actions);
+}
+
+#[test]
+fn edited_trees_round_trip_through_a_file() {
+    let dir = temp_dir("edited-roundtrip");
+    let path = dir.join("edited.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs", 30);
+    spot.added_lines = vec!["Bet(75)".to_owned()];
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+    let (jobs, done) = solve(spot);
+    assert!(done.saved_to.is_some());
+
+    let reopened = jobs.open(&path.to_string_lossy(), None).unwrap();
+    let root = jobs.node(reopened.job_id, &[]).unwrap();
+    assert!(
+        root.actions.iter().any(|a| a == "Bet(75)"),
+        "the file carried the edit: {:?}",
+        root.actions
+    );
+
+    std::fs::remove_dir_all(dir).ok();
 }
