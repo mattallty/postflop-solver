@@ -52,7 +52,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// its own, and bumping the engine revision for a protocol change would be a lie in the other
 /// direction — a host that keys "can I open this file?" on an exact match would mark a whole
 /// library of saved solves unreadable for a change that never touched the engine.
-pub const ENGINE_REV: &str = "9f3cf968d16f05a06f35adb6e5cb6e6b99667f0a";
+pub const ENGINE_REV: &str = "7a7ebbb4dbc415b6e71cef0e98d7b99e82d501c8";
 
 /// The version string the engine stamps into every solution it writes.
 ///

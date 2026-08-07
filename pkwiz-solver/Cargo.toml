@@ -1,6 +1,6 @@
 [package]
 name = "pkwiz-solver"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Set by the engine next door, which uses `AtomicU64::try_update` and `u64::isolate_lowest_one`.
 rust-version = "1.97"
