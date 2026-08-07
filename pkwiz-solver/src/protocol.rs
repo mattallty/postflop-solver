@@ -52,7 +52,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// its own, and bumping the engine revision for a protocol change would be a lie in the other
 /// direction — a host that keys "can I open this file?" on an exact match would mark a whole
 /// library of saved solves unreadable for a change that never touched the engine.
-pub const ENGINE_REV: &str = "a0b680fdd4c9b9066269cb492f477229bcc0b4d4";
+pub const ENGINE_REV: &str = "9f3cf968d16f05a06f35adb6e5cb6e6b99667f0a";
 
 /// The version string the engine stamps into every solution it writes.
 ///
@@ -103,8 +103,9 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 ///
 /// Verified 2026-08-02, for the oldest four: the same spot saved by every pair of builds is
 /// byte-identical, and each opens the others' files with identical node output. Each later
-/// pin move was verified the same way against the head built on top of it — most recently
-/// `f664271` (2026-08-07), where for the first time the files were NOT byte-identical: they
+/// pin move was verified the same way against the head built on top of it, including
+/// `a0b680f` — PR #30: the `check_decoded` feature gate, with no format or layout change —
+/// and `f664271` (2026-08-07), where for the first time the files were NOT byte-identical: they
 /// differ in exactly two bytes, both of them the self-reported memory-usage accounting (the
 /// header estimate and `misc_memory_usage`), because the ICM state enlarged the game struct
 /// and the accounting honestly says so. Every config, strategy, and node byte is identical,
@@ -122,6 +123,7 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// clean version mismatch.
 pub const ENGINE_COMPATIBLE_REVS: &[&str] = &[
     ENGINE_REV,
+    "a0b680fdd4c9b9066269cb492f477229bcc0b4d4",
     "f664271d0f38dcf24bd6e83d900d15b1e979bff6",
     "35c5029bcaf2bdb7f7fa6b2c8761e83f0b06cf8b",
     "d1f740dfef713f1883b4b601b26c513502b98966",
