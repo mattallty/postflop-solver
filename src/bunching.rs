@@ -256,6 +256,7 @@ impl BunchingData {
     /// length are claims from the file. In particular, `is_ready()` derived from forged
     /// phase fields with empty result vectors would send `set_bunching_effect` indexing into
     /// nothing, and an unsorted or out-of-range flop trips `compress_mask` on its assertions.
+    #[cfg(feature = "bincode")]
     pub(crate) fn check_decoded(&self) -> Result<(), String> {
         if self.fold_ranges.is_empty() || self.fold_ranges.len() > 4 {
             return Err(format!(
