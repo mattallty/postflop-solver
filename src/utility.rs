@@ -70,7 +70,7 @@ pub fn compute_average(slice: &[f32], weights: &[f32]) -> f32 {
 }
 
 #[inline]
-fn weighted_sum(values: &[f32], weights: &[f32]) -> f32 {
+pub(crate) fn weighted_sum(values: &[f32], weights: &[f32]) -> f32 {
     let f = |sum: f64, (&v, &w): (&f32, &f32)| sum + v as f64 * w as f64;
     values.iter().zip(weights).fold(0.0, f) as f32
 }

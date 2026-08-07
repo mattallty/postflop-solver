@@ -1,7 +1,10 @@
 mod base;
+mod best_response;
 mod evaluation;
 mod interpreter;
 mod node;
+
+pub use best_response::BestResponse;
 
 #[cfg(feature = "bincode")]
 mod serialization;

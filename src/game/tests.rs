@@ -1884,3 +1884,463 @@ fn loading_a_bit_flipped_turn_game_file_never_panics() {
         "truncated turn",
     );
 }
+
+/// The `tiny_river_game` spot, actually solved rather than finalized at the uniform strategy.
+fn solved_tiny_river_game() -> PostFlopGame {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+        ],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    solve(&mut game, 1000, 0.06, false);
+    game
+}
+
+#[test]
+fn best_response_total_ev_matches_compute_mes_ev() {
+    let game = solved_tiny_river_game();
+    let mes_ev = compute_mes_ev(&game);
+    let current_ev = compute_current_ev(&game);
+
+    for (player, &mes_ev) in mes_ev.iter().enumerate() {
+        let br = game.compute_best_response(player, false);
+        // the same recursion over the same inputs
+        assert!(
+            (br.total_ev() - mes_ev).abs() < 1e-4,
+            "player {player}: {} vs {mes_ev}",
+            br.total_ev(),
+        );
+        // the maximally exploitative strategy dominates the current one
+        assert!(br.total_ev() >= current_ev[player] - 1e-4);
+        assert!(!br.has_detail());
+        assert!(br.memory_usage() > 0);
+    }
+}
+
+#[test]
+fn best_response_strategy_is_pure_and_achieves_its_value() {
+    let mut game = solved_tiny_river_game();
+    let br = game.compute_best_response(0, true);
+    assert!(br.has_detail());
+
+    game.cache_normalized_weights();
+    let weights = game.normalized_weights(0).to_vec();
+    let ev = game.br_expected_values(&br);
+
+    // the root average recovers the whole-game best-response EV (plus the pot/2 bias)
+    let average = compute_average(&ev, &weights);
+    assert!(
+        (average - (br.total_ev() + 30.0)).abs() < 1e-2,
+        "{average} vs {}",
+        br.total_ev() + 30.0
+    );
+
+    let num_hands = game.num_private_hands(0);
+    let num_actions = game.available_actions().len();
+    assert_eq!(num_actions, 2); // Check | Bet(30)
+
+    let strategy = game.br_strategy(&br);
+    let actions = game.br_actions(&br);
+    let detail = game.br_expected_values_detail(&br);
+
+    for hand in 0..num_hands {
+        // no locks, so every hand is a pure argmax
+        let action = actions[hand].unwrap();
+        for a in 0..num_actions {
+            let expected = if a == action { 1.0 } else { 0.0 };
+            assert_eq!(strategy[a * num_hands + hand], expected);
+        }
+
+        // the claimed value is the maximum of the per-action values (the root offers no fold,
+        // so the display convention zeroes no row)
+        if weights[hand] > 0.0 {
+            let best = (0..num_actions)
+                .map(|a| detail[a * num_hands + hand])
+                .fold(f32::MIN, f32::max);
+            assert!((ev[hand] - best).abs() < 1e-3, "{} vs {best}", ev[hand]);
+            assert!(detail[action * num_hands + hand] >= best - 1e-3);
+        }
+    }
+}
+
+/// Builds the `node_locking` spot with the given fold/call frequencies locked at the node
+/// facing the all-in, and solves it.
+fn locked_all_in_game(fold: f32, call: f32) -> PostFlopGame {
+    let card_config = CardConfig {
+        range: ["AsAh,QsQh".parse().unwrap(), "KsKh".parse().unwrap()],
+        flop: flop_from_str("2s3h4d").unwrap(),
+        turn: card_from_str("6c").unwrap(),
+        river: card_from_str("7c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 20,
+        effective_stack: 10,
+        river_bet_sizes: [("a", "").try_into().unwrap(), ("a", "").try_into().unwrap()],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    game.play(1); // all-in
+    game.lock_current_strategy(&[fold, call]);
+    game.back_to_root();
+
+    solve(&mut game, 1000, 0.0, false);
+    game
+}
+
+#[test]
+fn best_response_respects_locked_strategies() {
+    let mut game = locked_all_in_game(0.25, 0.75);
+
+    // the best response of the locked player keeps the pinned distribution at the locked node
+    let br = game.compute_best_response(1, true);
+    game.play(1);
+    game.cache_normalized_weights();
+    assert_eq!(game.current_player(), 1);
+
+    assert_eq!(game.br_actions(&br), vec![None]);
+    let strategy = game.br_strategy(&br);
+    assert!((strategy[0] - 0.25).abs() < 1e-6);
+    assert!((strategy[1] - 0.75).abs() < 1e-6);
+
+    // its value there is the pinned-mix value, i.e., the current strategy's own EV
+    let br_ev = game.br_expected_values(&br);
+    let ev = game.expected_values(1);
+    assert!((br_ev[0] - ev[0]).abs() < 1e-2, "{br_ev:?} vs {ev:?}");
+
+    // the total EV still matches `compute_mes_ev`, which honours locks the same way
+    assert!((br.total_ev() - compute_mes_ev(&game)[1]).abs() < 1e-4);
+}
+
+#[test]
+fn best_response_of_the_opponent_tracks_the_locked_strategy() {
+    // folding only 25% makes the bluff -EV, so QQ's best response is Check while AA's is the
+    // all-in (hand order: QQ, AA)
+    let game = locked_all_in_game(0.25, 0.75);
+    let br = game.compute_best_response(0, true);
+    assert_eq!(game.br_actions(&br), vec![Some(0), Some(1)]);
+
+    // folding half makes the bluff +EV, so QQ's best response flips to the all-in
+    let game = locked_all_in_game(0.5, 0.5);
+    let br = game.compute_best_response(0, true);
+    assert_eq!(game.br_actions(&br), vec![Some(1), Some(1)]);
+}
+
+#[test]
+fn best_response_breaks_ties_to_the_lowest_action_index() {
+    // OOP holds the losing range and IP is locked to fold against either bet size: both bets
+    // then win exactly the starting pot, so their values tie bit-for-bit, and checking loses
+    // the showdown. Every tie must resolve to the lower action index.
+    let card_config = CardConfig {
+        range: [
+            "QQ,JJ".parse::<Range>().unwrap(),
+            "AA,KK".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%,100%", "")).unwrap(),
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+        ],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    assert_eq!(
+        game.available_actions(),
+        vec![Action::Check, Action::Bet(30), Action::Bet(60)]
+    );
+
+    for action in [1, 2] {
+        game.apply_history(&[action]);
+        let num_hands = game.num_private_hands(1);
+        let mut lock = vec![0.0; 2 * num_hands];
+        lock[..num_hands].fill(1.0); // 100% fold
+        game.lock_current_strategy(&lock);
+    }
+    game.back_to_root();
+    finalize(&mut game);
+
+    let br = game.compute_best_response(0, true);
+    game.cache_normalized_weights();
+
+    let num_hands = game.num_private_hands(0);
+    let detail = game.br_expected_values_detail(&br);
+    assert_eq!(
+        detail[num_hands..2 * num_hands],
+        detail[2 * num_hands..3 * num_hands],
+        "the two bet sizes win the same pot against a locked fold"
+    );
+    assert_eq!(game.br_actions(&br), vec![Some(1); num_hands]);
+}
+
+#[test]
+fn best_response_below_isomorphism_eliminated_cards() {
+    // the `node_locking_isomorphism` spot: a monotone flop makes the three non-club suits
+    // isomorphic, so most turn/river deals are answered through a suit swap
+    let card_config = CardConfig {
+        range: ["AKs".parse().unwrap(), "AKs".parse().unwrap()],
+        flop: flop_from_str("2c3c4c").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 10,
+        effective_stack: 10,
+        river_bet_sizes: [("a", "").try_into().unwrap(), Default::default()],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    game.allocate_memory(false);
+    game.apply_history(&[0, 0, 15, 0, 0, 14]); // Turn: 5s, River: 5h
+    game.lock_current_strategy(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // AhKh -> check
+
+    finalize(&mut game);
+
+    let br = game.compute_best_response(0, true);
+
+    // where the locked hand sits in view coordinates on each isomorphic line — the positions
+    // `node_locking_isomorphism` pins for `strategy()`
+    let cases: [(&[usize], usize); 6] = [
+        (&[0, 0, 13, 0, 0, 14], 2),
+        (&[0, 0, 13, 0, 0, 15], 3),
+        (&[0, 0, 14, 0, 0, 13], 1),
+        (&[0, 0, 14, 0, 0, 15], 3),
+        (&[0, 0, 15, 0, 0, 13], 1),
+        (&[0, 0, 15, 0, 0, 14], 2),
+    ];
+
+    let mut sorted_evs: Vec<Vec<f32>> = Vec::new();
+    for (history, locked_index) in cases {
+        game.apply_history(history);
+        game.cache_normalized_weights();
+
+        let num_hands = game.num_private_hands(0);
+        let strategy = game.br_strategy(&br);
+        let actions = game.br_actions(&br);
+
+        for hand in 0..num_hands {
+            if hand == locked_index {
+                // the locked hand keeps its pinned pure check, and moves with the suit swap
+                assert_eq!(actions[hand], None);
+                assert_eq!(strategy[hand], 1.0);
+                assert_eq!(strategy[num_hands + hand], 0.0);
+            } else {
+                // unlocked hands are one-hot at their argmax
+                let action = actions[hand].unwrap();
+                for a in 0..2 {
+                    let expected = if a == action { 1.0 } else { 0.0 };
+                    assert_eq!(strategy[a * num_hands + hand], expected);
+                }
+            }
+        }
+
+        // hand-wise, the best response dominates the current strategy...
+        let br_ev = game.br_expected_values(&br);
+        let ev = game.expected_values(0);
+        for hand in 0..num_hands {
+            assert!(
+                br_ev[hand] >= ev[hand] - 1e-3,
+                "hand {hand} at {history:?}: {} < {}",
+                br_ev[hand],
+                ev[hand]
+            );
+        }
+
+        // ...and isomorphic lines answer the same multiset of hand values
+        let mut sorted = br_ev;
+        sorted.sort_by(f32::total_cmp);
+        sorted_evs.push(sorted);
+    }
+
+    for pair in sorted_evs.windows(2) {
+        for (a, b) in pair[0].iter().zip(pair[1].iter()) {
+            assert!((a - b).abs() < 1e-5, "{:?} vs {:?}", pair[0], pair[1]);
+        }
+    }
+}
+
+#[test]
+fn best_response_with_bunching_matches_compute_mes_ev() {
+    let flop = flop_from_str("Td9d6h").unwrap();
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop,
+        turn: card_from_str("Qc").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: 60,
+        effective_stack: 970,
+        river_bet_sizes: [("50%", "").try_into().unwrap(), Default::default()],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+
+    let mut bunching_data = BunchingData::new(&["22+,A2s+,A2o+".parse().unwrap()], flop).unwrap();
+    bunching_data.process(false);
+    game.set_bunching_effect(&bunching_data).unwrap();
+
+    game.allocate_memory(false);
+    solve(&mut game, 100, 0.6, false);
+
+    let mes_ev = compute_mes_ev(&game);
+    for (player, &mes_ev) in mes_ev.iter().enumerate() {
+        let br = game.compute_best_response(player, false);
+        assert!(
+            (br.total_ev() - mes_ev).abs() < 1e-4,
+            "player {player}: {} vs {mes_ev}",
+            br.total_ev(),
+        );
+    }
+
+    // the position-aware read works unchanged under bunching
+    let br = game.compute_best_response(0, false);
+    game.back_to_root();
+    game.cache_normalized_weights();
+    let ev = game.br_expected_values(&br);
+    assert_eq!(ev.len(), game.num_private_hands(0));
+    assert!(ev.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+#[should_panic(expected = "Game is not ready")]
+fn best_response_requires_allocated_memory() {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.compute_best_response(0, false);
+}
+
+#[test]
+#[should_panic(expected = "Invalid player")]
+fn best_response_rejects_a_bad_player() {
+    let game = tiny_river_game();
+    game.compute_best_response(2, false);
+}
+
+#[test]
+#[should_panic(expected = "Storage mode is not compatible")]
+fn best_response_rejects_reduced_storage() {
+    let game = truncated_turn_game();
+    game.compute_best_response(0, false);
+}
+
+#[test]
+#[should_panic(expected = "Chance node is not allowed")]
+fn br_strategy_rejects_a_chance_node() {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Turn,
+        starting_pot: 60,
+        effective_stack: 60,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    let br = game.compute_best_response(0, false);
+    game.play(0);
+    game.play(0);
+    assert!(game.is_chance_node());
+    game.br_strategy(&br);
+}
+
+#[test]
+#[should_panic(expected = "Current player is not the best-response player")]
+fn br_strategy_rejects_the_wrong_player() {
+    let game = tiny_river_game();
+    let br = game.compute_best_response(1, false);
+    game.br_strategy(&br); // the root is OOP's node
+}
+
+#[test]
+#[should_panic(expected = "Normalized weights are not cached")]
+fn br_expected_values_requires_cached_weights() {
+    let mut game = tiny_river_game();
+    let br = game.compute_best_response(0, false);
+    game.play(0);
+    game.br_expected_values(&br);
+}
+
+#[test]
+#[should_panic(expected = "without detail")]
+fn br_expected_values_detail_requires_detail() {
+    let mut game = tiny_river_game();
+    let br = game.compute_best_response(0, false);
+    game.cache_normalized_weights();
+    game.br_expected_values_detail(&br);
+}

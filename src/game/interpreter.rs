@@ -1252,7 +1252,7 @@ impl PostFlopGame {
 
     /// Applies the swap.
     #[inline]
-    fn apply_swap(&self, slice: &mut [f32], player: usize, reverse: bool) {
+    pub(super) fn apply_swap<T>(&self, slice: &mut [T], player: usize, reverse: bool) {
         let turn_swap = self
             .turn_swap
             .map(|suit| &self.isomorphism_swap_turn[suit as usize][player]);
