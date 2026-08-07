@@ -184,10 +184,11 @@ pub enum Command {
     Forget { job_id: JobId },
     /// Read a solution back as a new, already-finished job.
     ///
-    /// A game file does **not** record whether it was solved with a bunching effect — the
-    /// engine's format has no field for it — so reopening a bunching solve without the
-    /// `bunching` parameter silently yields non-bunching numbers. Hosts that save bunching
-    /// solves are advised to record the preparation's file path in the memo they save with.
+    /// A game file does **not** record whether it was solved with a bunching effect or under
+    /// ICM — the engine's format has no field for either — so reopening such a solve without
+    /// the `bunching`/`icm` parameter silently yields chip-space, non-bunching numbers.
+    /// Hosts that save such solves are advised to record the configuration (the preparation's
+    /// file path, the ICM payouts and stacks) in the memo they save with.
     #[serde(rename = "open", rename_all = "camelCase")]
     Open {
         path: String,
@@ -201,6 +202,10 @@ pub enum Command {
         /// re-apply it too.
         #[serde(default)]
         bunching: Option<BunchingRef>,
+        /// ICM configuration to re-apply to the loaded game, as `Spot::icm`. Validated
+        /// against the loaded tree, and remembered on the job for transparent reloads.
+        #[serde(default)]
+        icm: Option<crate::spot::IcmSpec>,
     },
     /// Prepare bunching-effect data as a job of its own: minutes of computation, ~62 MB kept,
     /// reusable by every later `solve` on the same flop via `spot.bunching`.
@@ -356,7 +361,8 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
             path,
             max_memory_bytes,
             bunching,
-        } => json(&jobs.open(&path, max_memory_bytes, bunching)?)?,
+            icm,
+        } => json(&jobs.open(&path, max_memory_bytes, bunching, icm)?)?,
         Command::PrepareBunching { bunching } => json(&jobs.submit_bunching(*bunching)?)?,
         Command::OpenBunching {
             path,

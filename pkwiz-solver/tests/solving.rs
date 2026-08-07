@@ -58,6 +58,7 @@ fn river(board: &str, range: &str, iterations: u32) -> Spot {
         removed_lines: Vec::new(),
         locks: Vec::new(),
         bunching: None,
+        icm: None,
     }
 }
 
@@ -346,7 +347,9 @@ fn a_solution_survives_a_round_trip_through_a_file() {
     assert!(done.error.is_none(), "{:?}", done.error);
     let before = jobs.node(done.job_id, &[]).unwrap();
 
-    let reopened = jobs.open(&path.to_string_lossy(), None, None).unwrap();
+    let reopened = jobs
+        .open(&path.to_string_lossy(), None, None, None)
+        .unwrap();
     assert_eq!(reopened.phase, Phase::Done);
     assert_ne!(reopened.job_id, done.job_id);
     let after = jobs.node(reopened.job_id, &[]).unwrap();
@@ -395,7 +398,9 @@ fn a_saved_solution_is_compressed_and_the_raw_form_still_opens() {
     // Both forms open, and to the same strategy. The uncompressed one is the shape every file
     // written before this was turned on has, so this is also the back-compatibility check.
     for path in [&compressed, &raw] {
-        let reopened = jobs.open(&path.to_string_lossy(), None, None).unwrap();
+        let reopened = jobs
+            .open(&path.to_string_lossy(), None, None, None)
+            .unwrap();
         let after = jobs.node(reopened.job_id, &[]).unwrap();
         assert_eq!(after.strategy, before.strategy, "{}", path.display());
         assert_eq!(after.equity, before.equity, "{}", path.display());
@@ -567,7 +572,9 @@ fn opening_a_file_hands_back_the_trees_that_are_already_on_disk() {
     let before = jobs.node(solved.job_id, &[]).unwrap();
 
     // First open: the solve's own tree goes back.
-    let first = jobs.open(&path.to_string_lossy(), None, None).unwrap();
+    let first = jobs
+        .open(&path.to_string_lossy(), None, None, None)
+        .unwrap();
     assert!(first.resident);
     assert!(
         !jobs.status(solved.job_id).unwrap().resident,
@@ -576,7 +583,9 @@ fn opening_a_file_hands_back_the_trees_that_are_already_on_disk() {
 
     // Second open of the same file: the first opened job goes back too, rather than the session
     // holding two copies of one solution.
-    let second = jobs.open(&path.to_string_lossy(), None, None).unwrap();
+    let second = jobs
+        .open(&path.to_string_lossy(), None, None, None)
+        .unwrap();
     assert_ne!(second.job_id, first.job_id);
     assert!(
         !jobs.status(first.job_id).unwrap().resident,
@@ -679,6 +688,7 @@ fn a_realistic_flop_solve() {
         removed_lines: Vec::new(),
         locks: Vec::new(),
         bunching: None,
+        icm: None,
     };
 
     for (label, sizing) in [
@@ -793,8 +803,10 @@ fn open_refuses_a_file_bigger_than_its_budget() {
 
     // A one-byte budget refuses any real tree — the same refusal-over-OOM-kill contract the
     // solve path provides — while the default budget still opens it.
-    assert!(jobs.open(&path.to_string_lossy(), Some(1), None).is_err());
-    assert!(jobs.open(&path.to_string_lossy(), None, None).is_ok());
+    assert!(jobs
+        .open(&path.to_string_lossy(), Some(1), None, None)
+        .is_err());
+    assert!(jobs.open(&path.to_string_lossy(), None, None, None).is_ok());
 
     std::fs::remove_dir_all(dir).ok();
 }
@@ -1141,7 +1153,9 @@ fn edited_trees_round_trip_through_a_file() {
     let (jobs, done) = solve(spot);
     assert!(done.saved_to.is_some());
 
-    let reopened = jobs.open(&path.to_string_lossy(), None, None).unwrap();
+    let reopened = jobs
+        .open(&path.to_string_lossy(), None, None, None)
+        .unwrap();
     let root = jobs.node(reopened.job_id, &[]).unwrap();
     assert!(
         root.actions.iter().any(|a| a == "Bet(75)"),

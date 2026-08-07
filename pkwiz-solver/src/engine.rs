@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use postflop_solver::{
     compute_current_ev, compute_exploitability, finalize, solve_step, ActionTree, BunchingData,
-    CardConfig, PostFlopGame, NOT_DEALT,
+    CardConfig, IcmConfig, PostFlopGame, NOT_DEALT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -334,7 +334,16 @@ fn construct_validated(
         &validated.added_lines,
         &validated.removed_lines,
     )?;
-    let game = PostFlopGame::with_config(card_config, action_tree).map_err(EngineError::Build)?;
+    let mut game =
+        PostFlopGame::with_config(card_config, action_tree).map_err(EngineError::Build)?;
+
+    // Right after the build, before the memory estimate: the effect adds only a small
+    // per-terminal-amount table, so the estimate is untouched, and an engine-side refusal
+    // (the sidecar's synchronous mirror should have caught it) fails the job with the
+    // engine's own message.
+    if let Some(icm) = &validated.icm {
+        game.set_icm_effect(icm).map_err(EngineError::Build)?;
+    }
 
     let (uncompressed, compressed) = game.memory_usage();
     // The bunching arena's size depends only on the tree, not on the data, so the budget check
@@ -397,13 +406,19 @@ pub struct Solved {
     pub iterations: u32,
     pub exploitability: f32,
     pub target_exploitability: f32,
-    /// Expected value of each player at the root, bias-subtracted so it is zero-sum without rake.
+    /// Expected value of each player at the root, bias-subtracted so it is zero-sum without
+    /// rake. On an ICM job this is each player's $ delta versus the street-start ICM baseline
+    /// (not zero-sum — see `Spot::icm`).
     pub ev: [f32; 2],
     pub elapsed_ms: u64,
     pub history: Vec<Sample>,
 }
 
 /// Run the CFR loop.
+///
+/// `target` is the absolute exploitability to stop at, precomputed by the caller because its
+/// scale is mode-dependent: `stop.target_for(starting_pot)` in chip mode,
+/// `stop.target_in(icm_pot_value)` in ICM mode (where exploitability is measured in $).
 ///
 /// `on_progress` is called after every exploitability measurement with the iteration count and
 /// the value; it is the caller's job to throttle what it does with that.
@@ -419,12 +434,11 @@ pub struct Solved {
 pub fn run(
     game: &mut PostFlopGame,
     stop: &crate::spot::Stop,
-    starting_pot: i32,
+    target: f32,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(u32, f32),
 ) -> Solved {
     let started = Instant::now();
-    let target = stop.target_for(starting_pot);
 
     let mut exploitability = compute_exploitability(&*game);
     let mut history = vec![Sample {
@@ -575,27 +589,49 @@ pub fn save_bunching(
     })
 }
 
-/// Re-establish a bunching effect on a game loaded from disk — weights, tables *and* EVs.
+/// Re-establish the runtime effects (ICM and/or bunching) on a game loaded from disk —
+/// weights, tables *and* EVs.
 ///
-/// `set_bunching_effect` alone is not enough after a load: the file format omits the stored
-/// counterfactual values, and the decoder restores them by re-running `finalize` — necessarily
-/// *before* any bunching effect can be applied, so every stored EV on a freshly loaded game is
-/// a non-bunching evaluation of the saved strategy. (Weights and equity are computed live at
-/// read time, which is why they alone would look correct — the discrepancy is exactly the kind
-/// that survives a casual check.) So after applying the effect, `finalize` runs once more with
-/// bunching evaluation in place. It only *reads* the strategy — never rewrites it — so the
-/// second pass reproduces the pre-save EVs bit for bit; the private `Refinalize` wrapper below
-/// is what gets it past the already-solved refusal, the same state dance the decoder itself
-/// performs.
+/// `set_icm_effect`/`set_bunching_effect` alone are not enough after a load: the file format
+/// omits the stored counterfactual values, and the decoder restores them by re-running
+/// `finalize` — necessarily *before* any runtime effect can be applied, so every stored EV on
+/// a freshly loaded game is a plain chip-space evaluation of the saved strategy. (Weights and
+/// equity are computed live at read time, which is why they alone would look correct — the
+/// discrepancy is exactly the kind that survives a casual check.) So after applying the
+/// effects, `finalize` runs **once** more with the effect-aware evaluation in place. It only
+/// *reads* the strategy — never rewrites it — so the second pass reproduces the pre-save EVs
+/// bit for bit; the private `Refinalize` wrapper below is what gets it past the
+/// already-solved refusal, the same state dance the decoder itself performs.
+///
+/// With both `None` this is a no-op — no wasted finalize pass.
 ///
 /// # Errors
 ///
-/// The engine's `set_bunching_effect` refusals: data not ready, a flop that does not match, or
-/// fold ranges leaving no valid combination.
-pub fn reapply_bunching(game: &mut PostFlopGame, data: &BunchingData) -> Result<(), String> {
-    game.set_bunching_effect(data)?;
+/// The engine's `set_icm_effect` refusals (a configuration that does not match the loaded
+/// tree) and `set_bunching_effect` refusals (data not ready, a flop that does not match, or
+/// fold ranges leaving no valid combination).
+pub fn reapply_effects(
+    game: &mut PostFlopGame,
+    icm: Option<&IcmConfig>,
+    bunching: Option<&BunchingData>,
+) -> Result<(), String> {
+    if icm.is_none() && bunching.is_none() {
+        return Ok(());
+    }
+    if let Some(icm) = icm {
+        game.set_icm_effect(icm)?;
+    }
+    if let Some(data) = bunching {
+        game.set_bunching_effect(data)?;
+    }
     postflop_solver::finalize(&mut Refinalize(game));
     Ok(())
+}
+
+/// [`reapply_effects`] for the bunching-only case, kept for call sites and tests that predate
+/// ICM.
+pub fn reapply_bunching(game: &mut PostFlopGame, data: &BunchingData) -> Result<(), String> {
+    reapply_effects(game, None, Some(data))
 }
 
 /// A view of a solved [`PostFlopGame`] that [`postflop_solver::finalize`] will accept again.
@@ -645,6 +681,10 @@ impl postflop_solver::Game for Refinalize<'_> {
 
     fn is_raked(&self) -> bool {
         self.0.is_raked()
+    }
+
+    fn is_icm(&self) -> bool {
+        self.0.is_icm()
     }
 
     fn isomorphic_chances(&self, node: &Self::Node) -> &[u8] {

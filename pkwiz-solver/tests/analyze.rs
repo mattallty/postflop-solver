@@ -44,6 +44,7 @@ fn spot(board: &str, range: &str, iterations: u32) -> Spot {
         removed_lines: Vec::new(),
         locks: Vec::new(),
         bunching: None,
+        icm: None,
     }
 }
 

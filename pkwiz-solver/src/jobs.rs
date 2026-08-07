@@ -194,15 +194,26 @@ pub struct JobStatus {
     pub max_iterations: u32,
     /// `None` until the first measurement, which happens before iteration 1.
     pub exploitability: Option<f32>,
+    /// On an ICM job this — like `exploitability` and `ev` — is in payout units ($), scaled by
+    /// [`Self::icm_pot_value`] rather than [`Self::starting_pot`].
     pub target_exploitability: f32,
-    /// Pot the target is relative to, so a host can render "0.4 / 1.0 (0.5% of 200)".
+    /// Pot the target is relative to, so a host can render "0.4 / 1.0 (0.5% of 200)". Always
+    /// chips, even on an ICM job — [`Self::icm_pot_value`] is the $ scale there.
     pub starting_pot: i32,
+    /// What the starting pot is worth in payout units — the engine's `icm_pot_value`. Present
+    /// exactly when the spot has `icm`; the $ scale of `targetExploitability`,
+    /// `exploitability`, `history[].exploitability` and `ev`, so a host can render "0.5% of
+    /// pot" in either mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icm_pot_value: Option<f64>,
     pub elapsed_ms: u64,
     /// Present from the end of the build onwards.
     pub memory: Option<MemoryEstimate>,
     /// Why the loop ended; present once terminal.
     pub stopped: Option<Stopped>,
-    /// Root EV of each player, bias-subtracted. Present once the game is finalized.
+    /// Root EV of each player, bias-subtracted. Present once the game is finalized. On an ICM
+    /// job these are $ deltas versus the street-start ICM baseline and do **not** sum to zero
+    /// (see `Spot::icm`).
     pub ev: Option<[f32; 2]>,
     pub saved_to: Option<String>,
     /// Whether the tree is in memory right now.
@@ -228,6 +239,16 @@ pub struct JobStatus {
 
 impl JobStatus {
     fn new(job_id: JobId, spot: &Spot) -> Self {
+        // Under ICM every exploitability number is in $, so the percentage target scales by
+        // the pot's $ value instead of its chip count; an absolute target is read as $.
+        let icm_pot_value = spot
+            .icm
+            .as_ref()
+            .map(|icm| postflop_solver::icm_pot_value(&icm.to_config(), spot.pot));
+        let target_exploitability = match icm_pot_value {
+            Some(pot_value) => spot.stop.target_in(pot_value),
+            None => spot.stop.target_for(spot.pot),
+        };
         Self {
             job_id,
             kind: JobKind::Solve,
@@ -235,8 +256,9 @@ impl JobStatus {
             iterations: 0,
             max_iterations: spot.stop.max_iterations,
             exploitability: None,
-            target_exploitability: spot.stop.target_for(spot.pot),
+            target_exploitability,
             starting_pot: spot.pot,
+            icm_pot_value,
             elapsed_ms: 0,
             memory: None,
             stopped: None,
@@ -260,6 +282,7 @@ impl JobStatus {
             exploitability: None,
             target_exploitability: 0.0,
             starting_pot: 0,
+            icm_pot_value: None,
             elapsed_ms: 0,
             memory: None,
             stopped: None,
@@ -298,6 +321,7 @@ impl JobStatus {
             exploitability: None,
             target_exploitability: 0.0,
             starting_pot: 0,
+            icm_pot_value: None,
             elapsed_ms: 0,
             memory: None,
             stopped: None,
@@ -1013,15 +1037,23 @@ impl Jobs {
     /// preparation in the memo they save with. The ref is remembered on the job so transparent
     /// reloads re-apply it too.
     ///
+    /// `icm` re-applies an ICM effect the same way, for the same reason: the file records
+    /// nothing about it, and a solution solved under ICM reopened without this parameter
+    /// silently answers chip-space numbers (worse for flop/turn target-storage saves, whose
+    /// stored values *are* $ and would be read with the chip de-bias). The spec is validated
+    /// against the loaded tree and remembered on the job for transparent reloads.
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read, is not a solution, needs more memory than the cap allows, or
-    /// the bunching ref cannot be resolved or applied (wrong flop, not-ready data).
+    /// If the file cannot be read, is not a solution, needs more memory than the cap allows,
+    /// the bunching ref cannot be resolved or applied (wrong flop, not-ready data), or the
+    /// `icm` spec does not match the loaded tree.
     pub fn open(
         &self,
         path: &str,
         max_memory_bytes: Option<u64>,
         bunching: Option<BunchingRef>,
+        icm: Option<crate::spot::IcmSpec>,
     ) -> Result<JobStatus, JobError> {
         // Opening is the other moment the process is about to hold a whole tree — a solution
         // browser walking a library calls this and never `solve`, so without this the sweep would
@@ -1033,17 +1065,24 @@ impl Jobs {
 
         let (mut game, memo) = engine::load(path, max_memory_bytes)?;
 
+        // The spec is checked against the loaded tree with the same wire-named messages the
+        // solve path produces; the engine's own validation runs again inside
+        // `set_icm_effect`, but its messages name Rust fields.
+        if let Some(spec) = &icm {
+            spec.validate(game.tree_config().effective_stack)
+                .map_err(EngineError::Spot)?;
+        }
+        let icm_config = icm.as_ref().map(crate::spot::IcmSpec::to_config);
+
         let data = match &bunching {
             None => None,
-            Some(bref) => {
-                let data = resolve_bunching(&self.shared, bref, max_memory_bytes)?;
-                // The full re-apply, not bare `set_bunching_effect`: a loaded game's stored
-                // EVs were restored by the decoder without bunching (see
-                // `engine::reapply_bunching`) and must be recomputed under it.
-                engine::reapply_bunching(&mut game, &data).map_err(EngineError::Build)?;
-                Some(data)
-            }
+            Some(bref) => Some(resolve_bunching(&self.shared, bref, max_memory_bytes)?),
         };
+        // The full re-apply, not bare `set_*_effect`: a loaded game's stored EVs were
+        // restored by the decoder without any effect (see `engine::reapply_effects`) and must
+        // be recomputed under them — one finalize, both effects.
+        engine::reapply_effects(&mut game, icm_config.as_ref(), data.as_deref())
+            .map_err(EngineError::Build)?;
 
         let tree = game.tree_config();
         let spot = Spot {
@@ -1076,6 +1115,8 @@ impl Jobs {
             locks: Vec::new(),
             // The ref, not the data: it is what the transparent reload path consults.
             bunching,
+            // Likewise remembered so a reload after `release` re-applies the effect.
+            icm,
         };
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1601,12 +1642,16 @@ fn run_solve_job(shared: &Arc<Shared>, job: &Arc<Job>, spot: &Spot, started: Ins
         shared.emit_status(&snapshot);
     }
 
+    // Precomputed at submit time by `JobStatus::new`, mode-aware: chips against the pot, $
+    // against `icmPotValue` on an ICM job.
+    let target = job.status.lock().unwrap().target_exploitability;
+
     let mut last_emit = Instant::now();
     let solved = std::panic::catch_unwind(AssertUnwindSafe(|| {
         engine::run(
             &mut game,
             &spot.stop,
-            spot.pot,
+            target,
             &job.cancel,
             |iterations, exploitability| {
                 let mut status = job.status.lock().unwrap();
@@ -1853,26 +1898,40 @@ fn ensure_resident_game<'a>(
         // finished or been cancelled".
         let path = saved_to.ok_or(JobError::NeverRan(id))?;
         let mut game = engine::load(&path, job.task.max_memory_bytes())?.0;
-        // The file has no bunching field, so a game that was solved with it comes back
-        // *without* it here — re-applying (EVs included, see `engine::reapply_bunching`)
-        // is what keeps a released job's answers identical to its pre-release ones. Kept
-        // out of `*guard` until it succeeds: publishing the bare game on failure would
-        // answer the next read with silently different numbers, which is strictly worse
-        // than this error.
+        // The file has no bunching or ICM field, so a game that was solved with either comes
+        // back *without* them here — re-applying (EVs included, see
+        // `engine::reapply_effects`) is what keeps a released job's answers identical to its
+        // pre-release ones. Kept out of `*guard` until it succeeds: publishing the bare game
+        // on failure would answer the next read with silently different numbers, which is
+        // strictly worse than this error.
         if let Task::Solve(spot) = &job.task {
-            if let Some(bref) = &spot.bunching {
-                let wrap = |reason: String| JobError::BunchingUnavailable { id, reason };
-                let data = {
+            // ICM needs no Arc or resolution: the configuration lives in the spot itself.
+            let icm_config = spot.icm.as_ref().map(crate::spot::IcmSpec::to_config);
+            let data = match &spot.bunching {
+                None => None,
+                Some(bref) => {
+                    let wrap = |reason: String| JobError::BunchingUnavailable { id, reason };
                     // The job's own retained Arc survives `release` and `forget` of the
                     // preparation; the shared resolution path is only the fallback.
                     let own = job.bunching_data.lock().unwrap().clone();
-                    match own {
+                    Some(match own {
                         Some(data) => data,
                         None => resolve_bunching(shared, bref, spot.max_memory_bytes)
                             .map_err(|e| wrap(e.to_string()))?,
+                    })
+                }
+            };
+            // One finalize covers both effects.
+            engine::reapply_effects(&mut game, icm_config.as_ref(), data.as_deref()).map_err(
+                |reason| {
+                    if spot.bunching.is_some() {
+                        JobError::BunchingUnavailable { id, reason }
+                    } else {
+                        JobError::Engine(EngineError::Build(reason))
                     }
-                };
-                engine::reapply_bunching(&mut game, &data).map_err(wrap)?;
+                },
+            )?;
+            if let Some(data) = data {
                 *job.bunching_data.lock().unwrap() = Some(data);
             }
         }
@@ -1979,9 +2038,12 @@ pub struct NodeView {
     pub strategy: Vec<Vec<f32>>,
     /// Normalized weight of each hand, i.e. how much of the acting player's range it is here.
     pub weights: Vec<f32>,
-    /// Equity of each hand at this node.
+    /// Equity of each hand at this node. A pure win probability — identical in chip and ICM
+    /// mode.
     pub equity: Vec<f32>,
-    /// Expected value of each hand at this node.
+    /// Expected value of each hand at this node. On an ICM job this is **absolute tournament
+    /// $EV** (the street-start baseline added back) rather than expected pot recovery in
+    /// chips; same for [`Self::ev_detail`] and [`Self::average_ev`].
     pub ev: Vec<f32>,
     /// Expected value of each action of each of the acting player's hands, before the
     /// strategy is applied: `ev_detail[a][h]` is what hand `h` makes by taking action `a`
@@ -1990,7 +2052,8 @@ pub struct NodeView {
     ///
     /// Two engine conventions surface here: a `Fold` row is exactly `0.0` for every hand (the
     /// engine's fold-EV convention, not a computed value), and a hand with zero normalized
-    /// weight is `0.0` in every row. Empty at a terminal or chance node.
+    /// weight is `0.0` in every row. Empty at a terminal or chance node. Both sentinels hold
+    /// in ICM mode too — a `0.0` fold row must not be read as "$0 of tournament equity".
     #[serde(default)]
     pub ev_detail: Vec<Vec<f32>>,
     /// Whether any hand's strategy is pinned at this node (see `Spot::locks`). Always `false`

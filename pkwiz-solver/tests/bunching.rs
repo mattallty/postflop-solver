@@ -75,6 +75,7 @@ fn river_spot(iterations: u32) -> Spot {
         removed_lines: Vec::new(),
         locks: Vec::new(),
         bunching: None,
+        icm: None,
     }
 }
 

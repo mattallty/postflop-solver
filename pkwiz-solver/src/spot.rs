@@ -259,9 +259,16 @@ impl Stop {
     /// The absolute target this stop condition implies for a given pot.
     #[must_use]
     pub fn target_for(&self, starting_pot: i32) -> f32 {
-        self.target_exploitability.unwrap_or_else(|| {
-            (f64::from(starting_pot) * self.target_exploitability_pct / 100.0) as f32
-        })
+        self.target_in(f64::from(starting_pot))
+    }
+
+    /// [`Self::target_for`], against an arbitrary scale: the starting pot in chip mode, the
+    /// engine's `icm_pot_value` in ICM mode (where an absolute [`Self::target_exploitability`]
+    /// is read in $, the unit exploitability is measured in there).
+    #[must_use]
+    pub fn target_in(&self, scale: f64) -> f32 {
+        self.target_exploitability
+            .unwrap_or_else(|| (scale * self.target_exploitability_pct / 100.0) as f32)
     }
 }
 
@@ -350,6 +357,130 @@ impl BunchingSpec {
         ];
         postflop_solver::BunchingData::new(&ranges, flop)
             .map_err(|reason| SpotError::Bunching { reason })
+    }
+}
+
+/// The ICM (payout-adjusted) situation of a solve — `spot.icm`.
+///
+/// When present, the engine maps every chip outcome to tournament $EV via Malmuth–Harville
+/// before solving, and every EV the job reports — `JobStatus.ev`, `NodeView.ev`/`evDetail`,
+/// `bestResponse` values — is in payout units rather than chips (see the field docs on those
+/// types). `JobStatus.icmPotValue` carries the $ scale of the pot so a host can render targets
+/// in either unit.
+///
+/// Like bunching, ICM is a **runtime effect the file format does not record**: a `savePath`
+/// file written by an ICM solve reopens in chip space unless `open` is given the same `icm`
+/// again. Hosts are advised to record the configuration in the memo they save with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IcmSpec {
+    /// Remaining prizes, non-increasing, any $ unit. 1..=stacks.len(); places beyond the list
+    /// pay nothing. For `compress: true` jobs, prefer normalized units (fractions of the prize
+    /// pool) over raw dollar amounts in the millions — the i16 storage keeps more digits.
+    pub payouts: Vec<f64>,
+    /// Every remaining player's stack BEHIND at street start, caller chip units. 2..=10
+    /// entries, all positive; the shorter contestant stack must equal the spot's
+    /// `effectiveStack` (units consistency: the tree's all-ins must be a real bust).
+    pub stacks: Vec<f64>,
+    /// Index into `stacks` of the OOP player (player 0).
+    pub oop_seat: usize,
+    /// Index into `stacks` of the IP player (player 1).
+    pub ip_seat: usize,
+}
+
+impl IcmSpec {
+    /// The engine-side configuration this spec describes. Infallible field mapping; validation
+    /// is [`Self::validate`]'s job (and the engine re-checks on its side).
+    #[must_use]
+    pub fn to_config(&self) -> postflop_solver::IcmConfig {
+        postflop_solver::IcmConfig {
+            payouts: self.payouts.clone(),
+            stacks: self.stacks.clone(),
+            oop_seat: self.oop_seat,
+            ip_seat: self.ip_seat,
+        }
+    }
+
+    /// The synchronous mirror of the engine's `IcmConfig::validate`, with wire-named fields:
+    /// a bad `spot.icm` fails the `solve` command with a message a form can point at a box,
+    /// rather than a job that fails a moment later.
+    pub fn validate(&self, effective_stack: i32) -> Result<(), SpotError> {
+        let err = |reason: String| SpotError::Icm { reason };
+
+        let num_players = self.stacks.len();
+        if !(2..=10).contains(&num_players) {
+            return Err(err(format!(
+                "`icm.stacks` must list between 2 and 10 players; got {num_players}"
+            )));
+        }
+        for (i, &stack) in self.stacks.iter().enumerate() {
+            if !stack.is_finite() {
+                return Err(err(format!("`icm.stacks[{i}]` must be a finite number")));
+            }
+            if stack <= 0.0 {
+                return Err(err(format!("`icm.stacks[{i}]` must be positive")));
+            }
+        }
+
+        if self.payouts.is_empty() || self.payouts.len() > num_players {
+            return Err(err(format!(
+                "`icm.payouts` must list between 1 and {num_players} prizes; got {}",
+                self.payouts.len()
+            )));
+        }
+        for (i, &payout) in self.payouts.iter().enumerate() {
+            if !payout.is_finite() {
+                return Err(err(format!("`icm.payouts[{i}]` must be a finite number")));
+            }
+            if payout < 0.0 {
+                return Err(err(format!("`icm.payouts[{i}]` must not be negative")));
+            }
+        }
+        if self.payouts.windows(2).any(|w| w[0] < w[1]) {
+            return Err(err("`icm.payouts` must be non-increasing".to_owned()));
+        }
+        // Places beyond the payout list implicitly pay 0, so a short list is flat only if the
+        // first prize is itself 0.
+        let last_payout = if self.payouts.len() < num_players {
+            0.0
+        } else {
+            *self.payouts.last().unwrap()
+        };
+        if self.payouts[0] <= last_payout {
+            return Err(err(
+                "`icm.payouts` are flat; every outcome pays the same and there is nothing to \
+                 solve"
+                    .to_owned(),
+            ));
+        }
+
+        if self.oop_seat >= num_players {
+            return Err(err(format!(
+                "`icm.oopSeat` must index into `icm.stacks`; got {} of {num_players}",
+                self.oop_seat
+            )));
+        }
+        if self.ip_seat >= num_players {
+            return Err(err(format!(
+                "`icm.ipSeat` must index into `icm.stacks`; got {} of {num_players}",
+                self.ip_seat
+            )));
+        }
+        if self.oop_seat == self.ip_seat {
+            return Err(err(
+                "`icm.oopSeat` and `icm.ipSeat` must name different players".to_owned(),
+            ));
+        }
+
+        let min_contestant = self.stacks[self.oop_seat].min(self.stacks[self.ip_seat]);
+        if min_contestant != f64::from(effective_stack) {
+            return Err(err(format!(
+                "`icm.stacks` disagree with `effectiveStack`: the shorter contestant stack is \
+                 {min_contestant} where the effective stack is {effective_stack}"
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -443,6 +574,18 @@ pub struct Spot {
     /// file around for reopening.
     #[serde(default)]
     pub bunching: Option<BunchingRef>,
+    /// ICM (payout-adjusted) solving. Absent means chip EV, which is every solve that existed
+    /// before this field did.
+    ///
+    /// When present, every EV this job reports is in payout units: `JobStatus.ev` is each
+    /// player's $ delta versus the street-start ICM baseline (not zero-sum), and
+    /// `NodeView.ev`/`evDetail` are absolute tournament $EV. `JobStatus.icmPotValue` carries
+    /// the pot's $ scale, and `stop.targetExploitabilityPct` scales against it (an absolute
+    /// `stop.targetExploitability` is read in $). Like bunching, a `savePath` file records
+    /// **nothing** about ICM — reopen with `open`'s `icm` parameter or the numbers silently
+    /// come back in chip space.
+    #[serde(default)]
+    pub icm: Option<IcmSpec>,
 }
 
 /// Pin (part of) the acting player's strategy at one node before the solve.
@@ -507,6 +650,7 @@ impl Spot {
             removed_lines: Vec::new(),
             locks: Vec::new(),
             bunching: None,
+            icm: None,
         }
     }
 
@@ -641,6 +785,14 @@ impl Spot {
             }
         }
 
+        let icm = match &self.icm {
+            Some(spec) => {
+                spec.validate(self.effective_stack)?;
+                Some(spec.to_config())
+            }
+            None => None,
+        };
+
         Ok(Validated {
             board,
             oop,
@@ -648,6 +800,7 @@ impl Spot {
             tree_config,
             added_lines,
             removed_lines,
+            icm,
         })
     }
 }
@@ -744,6 +897,7 @@ pub struct Validated {
     pub tree_config: TreeConfig,
     pub added_lines: Vec<Vec<Action>>,
     pub removed_lines: Vec<Vec<Action>>,
+    pub icm: Option<postflop_solver::IcmConfig>,
 }
 
 /// A spot the caller described badly.
@@ -779,6 +933,8 @@ pub enum SpotError {
     EmptyNode { line: String },
     #[error("the bunching configuration is invalid: {reason}")]
     Bunching { reason: String },
+    #[error("the icm configuration is invalid: {reason}")]
+    Icm { reason: String },
 }
 
 #[cfg(test)]
@@ -970,6 +1126,85 @@ mod tests {
             let json = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<BunchingRef>(&json).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn a_spot_without_icm_still_parses_old_wire_json_verbatim() {
+        // The PROTOCOL_VERSION 1 guard, `spot.icm` edition: every request that predates the
+        // field must keep working and must mean "chip EV".
+        let spot: Spot = serde_json::from_str(
+            r#"{"oop":"QQ+","ip":"QQ+","board":"Td9d6h","pot":100,"effectiveStack":500}"#,
+        )
+        .unwrap();
+        assert_eq!(spot.icm, None);
+        assert!(spot.validate().unwrap().icm.is_none());
+
+        let with_icm: Spot = serde_json::from_str(
+            r#"{"oop":"QQ+","ip":"QQ+","board":"Td9d6h","pot":100,"effectiveStack":500,
+                "icm":{"payouts":[50.0,30.0,20.0],"stacks":[500,1400,2500],
+                       "oopSeat":0,"ipSeat":1}}"#,
+        )
+        .unwrap();
+        let spec = with_icm.icm.clone().unwrap();
+        assert_eq!(spec.payouts, [50.0, 30.0, 20.0]);
+        assert_eq!((spec.oop_seat, spec.ip_seat), (0, 1));
+        let validated = with_icm.validate().unwrap();
+        assert_eq!(validated.icm.unwrap(), spec.to_config());
+
+        // Round trip: what a host reads back is what it sent.
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<IcmSpec>(&json).unwrap(), spec);
+    }
+
+    #[test]
+    fn a_bad_icm_spec_names_the_offending_field() {
+        let base = || IcmSpec {
+            payouts: vec![50.0, 30.0, 20.0],
+            stacks: vec![500.0, 1400.0, 2500.0],
+            oop_seat: 0,
+            ip_seat: 1,
+        };
+        assert!(base().validate(500).is_ok());
+
+        type Mutation = Box<dyn Fn(&mut IcmSpec)>;
+        let cases: Vec<(Mutation, &str)> = vec![
+            (Box::new(|s| s.stacks = vec![500.0]), "`icm.stacks`"),
+            (Box::new(|s| s.stacks[1] = 0.0), "`icm.stacks[1]`"),
+            (Box::new(|s| s.stacks[2] = f64::INFINITY), "`icm.stacks[2]`"),
+            (
+                Box::new(|s| s.payouts = vec![50.0, 30.0, 20.0, 10.0]),
+                "`icm.payouts`",
+            ),
+            (
+                Box::new(|s| s.payouts = vec![50.0, 60.0, 20.0]),
+                "non-increasing",
+            ),
+            (Box::new(|s| s.payouts = vec![7.0, 7.0, 7.0]), "flat"),
+            (Box::new(|s| s.payouts[2] = -1.0), "`icm.payouts[2]`"),
+            (Box::new(|s| s.oop_seat = 9), "`icm.oopSeat`"),
+            (Box::new(|s| s.ip_seat = 0), "different players"),
+            (Box::new(|s| s.stacks[0] = 400.0), "effectiveStack"),
+        ];
+        for (mutate, needle) in cases {
+            let mut spec = base();
+            mutate(&mut spec);
+            let err = spec.validate(500).unwrap_err();
+            assert!(matches!(err, SpotError::Icm { .. }));
+            assert!(err.to_string().contains(needle), "`{err}` lacks {needle}");
+        }
+
+        // And through `Spot::validate`, so the `solve` command fails synchronously.
+        let mut spot: Spot = serde_json::from_str(
+            r#"{"oop":"QQ+","ip":"QQ+","board":"Td9d6h","pot":100,"effectiveStack":500}"#,
+        )
+        .unwrap();
+        let mut spec = base();
+        spec.stacks[0] = 400.0;
+        spot.icm = Some(spec);
+        assert!(matches!(
+            spot.validate().unwrap_err(),
+            SpotError::Icm { .. }
+        ));
     }
 
     #[test]
