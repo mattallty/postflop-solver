@@ -56,13 +56,14 @@
 //!
 //! # Analysis jobs, and what they hold
 //!
-//! A `report` or `dump` job ([`JobKind::Report`] / [`JobKind::Dump`]) owns no tree of its own —
-//! it reads a *source* solve job's game, holding that job's game lock for the whole run, which
-//! means `node` and `release` on the source block until the analysis finishes. The sweep does
-//! not: `release_recoverable` only *tries* each lock, so a tree an analysis is reading is
-//! skipped rather than waited for, and `open`/`solve` stay responsive during a minutes-long
-//! dump. A report's result is a small JSON value kept on the job row (`report_result`),
-//! untouched by `release` — only `forget` drops it; a dump's product is the file it wrote.
+//! A `report`, `dump` or `simplify` job ([`JobKind::Report`] / [`JobKind::Dump`] /
+//! [`JobKind::Simplify`]) owns no tree of its own — it reads a *source* solve job's game,
+//! holding that job's game lock for the whole run, which means `node` and `release` on the
+//! source block until the analysis finishes. The sweep does not: `release_recoverable` only
+//! *tries* each lock, so a tree an analysis is reading is skipped rather than waited for, and
+//! `open`/`solve` stay responsive during a minutes-long dump. A report's or simplify's result
+//! is a JSON value kept on the job row (`report_result`), untouched by `release` — only
+//! `forget` drops it; a dump's product is the file it wrote.
 //!
 //! The module's one lock order is game → bunching_data → best_response → report_result →
 //! status; nothing nests them the other way, which is what keeps the module deadlock-free.
@@ -76,7 +77,7 @@ use std::time::{Duration, Instant};
 use postflop_solver::{Action, BestResponse, BunchingData, PostFlopGame};
 use serde::{Deserialize, Serialize};
 
-use crate::analyze::{self, AnalyzeError, DumpSpec, ReportKind, ReportSpec};
+use crate::analyze::{self, AnalyzeError, DumpSpec, ReportKind, ReportSpec, SimplifySpec};
 use crate::engine::{self, EngineError, MemoryEstimate, Sample, Solved, Stopped};
 use crate::spot::{BunchingRef, BunchingSpec, Spot};
 
@@ -129,6 +130,8 @@ pub enum JobKind {
     Report,
     /// A full-tree strategy dump of a finished solve to a JSON Lines file.
     Dump,
+    /// A grid-rounded simplification of one player's strategy, emitted as a locks array.
+    Simplify,
 }
 
 /// Progress and result of a bunching preparation — [`JobStatus::bunching`], on bunching jobs.
@@ -150,18 +153,19 @@ pub struct BunchingStatus {
     pub memory_bytes: Option<u64>,
 }
 
-/// Progress and identity of a report or dump job — [`JobStatus::analysis`], on those kinds.
+/// Progress and identity of a report, dump or simplify job — [`JobStatus::analysis`], on those
+/// kinds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisStatus {
     /// The solve job this analysis reads.
     pub source_job_id: JobId,
-    /// Nodes processed so far (report: nodes read; dump: nodes visited).
+    /// Nodes processed so far (report: nodes read; dump and simplify: nodes visited).
     pub nodes: u64,
     /// Report jobs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_kind: Option<ReportKind>,
-    /// Report jobs, set at `done`.
+    /// Report and simplify jobs, set at `done` — report rows, or locked nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
     /// Dump jobs: bytes written so far (pre-compression while running, the file's actual size
@@ -231,10 +235,14 @@ pub struct JobStatus {
     pub history: Vec<Sample>,
     /// Preparation progress and result. `null` on solve jobs.
     pub bunching: Option<BunchingStatus>,
-    /// Progress and identity of a report or dump job. `null` on other kinds. `#[serde(default)]`
-    /// so frames stored before this field existed still deserialize.
+    /// Progress and identity of a report, dump or simplify job. `null` on other kinds.
+    /// `#[serde(default)]` so frames stored before this field existed still deserialize.
     #[serde(default)]
     pub analysis: Option<AnalysisStatus>,
+    /// The job this one was re-solved from; `null` on jobs not created by `resolve`. On a
+    /// resolve of a resolve, the immediate parent only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_from: Option<JobId>,
 }
 
 impl JobStatus {
@@ -269,6 +277,7 @@ impl JobStatus {
             history: Vec::new(),
             bunching: None,
             analysis: None,
+            resolved_from: None,
         }
     }
 
@@ -300,11 +309,13 @@ impl JobStatus {
                 memory_bytes: None,
             }),
             analysis: None,
+            resolved_from: None,
         }
     }
 
-    /// The queued status of a report or dump job — [`Self::new_bunching`]'s mirror: inert solve
-    /// fields, `bunching` null, [`Self::analysis`] carrying identity and zeroed progress.
+    /// The queued status of a report, dump or simplify job — [`Self::new_bunching`]'s mirror:
+    /// inert solve fields, `bunching` null, [`Self::analysis`] carrying identity and zeroed
+    /// progress.
     fn new_analysis(
         job_id: JobId,
         kind: JobKind,
@@ -339,6 +350,7 @@ impl JobStatus {
                 bytes_written: path.is_some().then_some(0),
                 path,
             }),
+            resolved_from: None,
         }
     }
 }
@@ -370,6 +382,7 @@ enum Task {
     Bunching(BunchingSpec),
     Report(ReportSpec),
     Dump(DumpSpec),
+    Simplify(SimplifySpec),
 }
 
 impl Task {
@@ -380,7 +393,7 @@ impl Task {
         match self {
             Self::Solve(spot) => spot.memo.as_deref(),
             Self::Bunching(spec) => spec.memo.as_deref(),
-            Self::Report(_) | Self::Dump(_) => None,
+            Self::Report(_) | Self::Dump(_) | Self::Simplify(_) => None,
         }
         .unwrap_or_default()
     }
@@ -389,7 +402,7 @@ impl Task {
         match self {
             Self::Solve(spot) => spot.compression_level,
             Self::Bunching(spec) => spec.compression_level,
-            Self::Report(_) => None,
+            Self::Report(_) | Self::Simplify(_) => None,
             Self::Dump(spec) => spec.compression_level,
         }
     }
@@ -398,7 +411,18 @@ impl Task {
         match self {
             Self::Solve(spot) => spot.max_memory_bytes,
             Self::Bunching(spec) => spec.max_memory_bytes,
-            Self::Report(_) | Self::Dump(_) => None,
+            Self::Report(_) | Self::Dump(_) | Self::Simplify(_) => None,
+        }
+    }
+
+    /// The kind's wire name, for error messages that say what a job *is*.
+    const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Solve(_) => "solve",
+            Self::Bunching(_) => "bunching",
+            Self::Report(_) => "report",
+            Self::Dump(_) => "dump",
+            Self::Simplify(_) => "simplify",
         }
     }
 }
@@ -421,10 +445,12 @@ struct Job {
     /// of memory the release sweep exists to reclaim). Always `[None, None]` on a bunching
     /// job. Its place in the lock order is game → bunching_data → best_response → status.
     best_response: Mutex<[Option<Arc<BestResponse>>; 2]>,
-    /// On a report job: the finished result, published at `done`, served verbatim by
-    /// `reportResult`. Tens of KB at most, so `release` and the sweep leave it alone — only
-    /// `forget` drops it. Always `None` on other kinds. Locked between `best_response` and
-    /// `status` in the module's one lock order; nothing acquires `game` while holding it.
+    /// On a report or simplify job: the finished result, published at `done`, served verbatim
+    /// by `reportResult`. Reports are tens of KB at most; a simplify over a wide region can
+    /// reach MBs (it is a strategy in lock clothing). Either way `release` and the sweep leave
+    /// it alone — only `forget` drops it. Always `None` on other kinds. Locked between
+    /// `best_response` and `status` in the module's one lock order; nothing acquires `game`
+    /// while holding it.
     report_result: Mutex<Option<serde_json::Value>>,
 }
 
@@ -488,10 +514,12 @@ pub enum JobError {
     BadPlayer(usize),
     #[error("job {id} is a {kind} job, which has no solved tree to read")]
     NoTree { id: JobId, kind: &'static str },
-    #[error("job {0} is not a report job, so it has no report result")]
+    #[error("job {0} is not a report or simplify job, so it has no stored result")]
     NotReport(JobId),
     #[error("report {id} is {phase:?}; its result exists only once it is done")]
     ReportNotReady { id: JobId, phase: Phase },
+    #[error("job {id} cannot be re-solved: {reason}")]
+    NotResolvable { id: JobId, reason: String },
 }
 
 impl JobError {
@@ -518,6 +546,7 @@ impl JobError {
             // "this job (or this moment) has nothing to show" is one condition to branch on.
             Self::NoTree { .. } | Self::ReportNotReady { .. } => "not_readable",
             Self::NotReport(_) => "not_report",
+            Self::NotResolvable { .. } => "not_resolvable",
         }
     }
 }
@@ -568,51 +597,74 @@ impl Jobs {
     /// terminal without data, and its flop must match the spot's first three board cards —
     /// a `path` reference defers all of that to the worker, which is where the file is read.
     pub fn submit(&self, spot: Spot) -> Result<JobStatus, JobError> {
+        self.submit_inner(spot, None, None)
+    }
+
+    /// [`Jobs::submit`]'s body, shared with [`Jobs::resolve`]: a resolve is an ordinary solve
+    /// whose status names its parent and whose `bunching_data` slot may arrive pre-seeded with
+    /// the `Arc` the source solve actually used.
+    fn submit_inner(
+        &self,
+        spot: Spot,
+        resolved_from: Option<JobId>,
+        seed_bunching: Option<Arc<BunchingData>>,
+    ) -> Result<JobStatus, JobError> {
         let validated = spot.validate().map_err(EngineError::from)?;
 
-        if let Some(BunchingRef::Job { job_id }) = &spot.bunching {
-            let prep = self.job(*job_id)?;
-            let Task::Bunching(spec) = &prep.task else {
-                return Err(JobError::NotBunching { id: *job_id });
-            };
-            let has_data = prep.bunching_data.lock().unwrap().is_some();
-            let (phase, saved) = {
-                let status = prep.status.lock().unwrap();
-                (status.phase, status.saved_to.is_some())
-            };
-            // A running or queued preparation is fine — the FIFO guarantees it finishes before
-            // this solve starts. Terminal with neither data nor a file can never serve one.
-            if phase.is_terminal() && !has_data && !saved {
-                return Err(JobError::BunchingNotReady { id: *job_id, phase });
-            }
-            // Only the first three board cards have to match, sorted — the engine's own rule,
-            // checked here so the mismatch names the flops instead of failing the job later.
-            let ours = sorted_flop(&validated.board);
-            let theirs = spec
-                .flop
-                .cards()
-                .map(|cards| sorted_flop(&cards))
-                .unwrap_or_default();
-            if ours != theirs {
-                return Err(EngineError::Spot(crate::spot::SpotError::Bunching {
-                    reason: format!(
-                        "job {job_id} prepared flop {} but the spot's flop is {}",
-                        theirs.join(""),
-                        ours.join(""),
-                    ),
-                })
-                .into());
+        // The job-reference cross-checks are skipped on the seeded path: the seed *is* the
+        // data the source solve used — same board by construction, so the flop check would
+        // re-prove what already holds — and the preparation job it once named may have been
+        // forgotten since, which must not fail a resolve that carries the data itself.
+        if seed_bunching.is_none() {
+            if let Some(BunchingRef::Job { job_id }) = &spot.bunching {
+                let prep = self.job(*job_id)?;
+                let Task::Bunching(spec) = &prep.task else {
+                    return Err(JobError::NotBunching { id: *job_id });
+                };
+                let has_data = prep.bunching_data.lock().unwrap().is_some();
+                let (phase, saved) = {
+                    let status = prep.status.lock().unwrap();
+                    (status.phase, status.saved_to.is_some())
+                };
+                // A running or queued preparation is fine — the FIFO guarantees it finishes
+                // before this solve starts. Terminal with neither data nor a file can never
+                // serve one.
+                if phase.is_terminal() && !has_data && !saved {
+                    return Err(JobError::BunchingNotReady { id: *job_id, phase });
+                }
+                // Only the first three board cards have to match, sorted — the engine's own
+                // rule, checked here so the mismatch names the flops instead of failing the
+                // job later.
+                let ours = sorted_flop(&validated.board);
+                let theirs = spec
+                    .flop
+                    .cards()
+                    .map(|cards| sorted_flop(&cards))
+                    .unwrap_or_default();
+                if ours != theirs {
+                    return Err(EngineError::Spot(crate::spot::SpotError::Bunching {
+                        reason: format!(
+                            "job {job_id} prepared flop {} but the spot's flop is {}",
+                            theirs.join(""),
+                            ours.join(""),
+                        ),
+                    })
+                    .into());
+                }
             }
         }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let status = JobStatus::new(id, &spot);
+        let mut status = JobStatus::new(id, &spot);
+        status.resolved_from = resolved_from;
+        // The seed is stored before the id can reach the queue, so the worker can never race
+        // an empty slot.
         let job = Arc::new(Job {
             task: Task::Solve(Box::new(spot)),
             cancel: AtomicBool::new(false),
             status: Mutex::new(status.clone()),
             game: Mutex::new(None),
-            bunching_data: Mutex::new(None),
+            bunching_data: Mutex::new(seed_bunching),
             best_response: Mutex::new([None, None]),
             report_result: Mutex::new(None),
         });
@@ -626,6 +678,87 @@ impl Jobs {
         self.shared.wake.notify_all();
 
         Ok(status)
+    }
+
+    /// Re-solve a job's spot with modified locks and/or stop criteria, as a **new** solve job.
+    ///
+    /// The source row is untouched — phase, EVs, saved file and resident tree all stay as they
+    /// were — and the new job is an ordinary solve: FIFO-queued, built cold from the merged
+    /// spot, locks applied pre-solve, iteration 0. The tree-defining fields (ranges, board,
+    /// pot, stack, sizing, rake, edits, compress, bunching, icm) are inherited unchanged and
+    /// deliberately not overridable: changing any of them is a new spot, which is what `solve`
+    /// is for — and keeping the tree identical is what makes the source's and the resolve's
+    /// `ev`/`exploitability` comparable. Note that a lock change still moves the *whole*
+    /// equilibrium, so comparing EVs across different locks is only meaningful deliberately
+    /// (the `simplify` cost measurement is exactly that reading).
+    ///
+    /// `locks`: absent inherits the source's, present replaces wholesale (`[]` clears — which
+    /// is also the unlock-everything path). `stop`: absent inherits, present is a full `Stop`
+    /// whose absent fields take the same serde defaults a fresh `solve` gets — never the
+    /// source's values. `save_path` is **never** inherited: carrying it over would overwrite
+    /// the source's saved file on completion and break its release/reload contract.
+    ///
+    /// Any phase is a legal source — the spot is complete and immutable from submit time, so
+    /// re-solving a queued, cancelled or even *failed* source (say, one that failed on a bad
+    /// lock, with corrected locks) is well-defined.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::NotResolvable`] for a job with no spot to rebuild — bunching, report, dump
+    /// and simplify jobs, and jobs created by `open` (their placeholder spot cannot rebuild a
+    /// game); otherwise as [`Jobs::submit`] on the merged spot.
+    pub fn resolve(
+        &self,
+        id: JobId,
+        locks: Option<Vec<crate::spot::Lock>>,
+        stop: Option<crate::spot::Stop>,
+        save_path: Option<String>,
+        max_memory_bytes: Option<u64>,
+        memo: Option<String>,
+    ) -> Result<JobStatus, JobError> {
+        let source = self.job(id)?;
+        let Task::Solve(spot) = &source.task else {
+            return Err(JobError::NotResolvable {
+                id,
+                reason: format!(
+                    "it is a {} job, which has no spot to rebuild a tree from",
+                    source.task.kind_name()
+                ),
+            });
+        };
+        // `open`'s placeholder spot, recognised by its empty oop notation (see the comment at
+        // its construction site): the file it loaded records neither ranges nor sizing.
+        if matches!(&spot.oop, crate::spot::RangeSpec::Notation(s) if s.is_empty()) {
+            return Err(JobError::NotResolvable {
+                id,
+                reason: "it was created by `open`; a solution file does not record the ranges \
+                         and sizing needed to rebuild its tree"
+                    .to_owned(),
+            });
+        }
+
+        let mut merged = (**spot).clone();
+        if let Some(locks) = locks {
+            merged.locks = locks;
+        }
+        if let Some(stop) = stop {
+            merged.stop = stop;
+        }
+        // Never inherited (see the doc-comment); absent means in-memory only.
+        merged.save_path = save_path;
+        if let Some(cap) = max_memory_bytes {
+            merged.max_memory_bytes = Some(cap);
+        }
+        if let Some(memo) = memo {
+            merged.memo = Some(memo);
+        }
+
+        // The source's retained Arc, cloned before the new id can reach the queue. Free while
+        // the source lives, correct by construction (same board, the data the source actually
+        // used), and what lets a resolve outlive a forgotten preparation job. No other lock is
+        // held here, so the module's lock order is untouched.
+        let seed = source.bunching_data.lock().unwrap().clone();
+        self.submit_inner(merged, Some(id), seed)
     }
 
     /// Accept a bunching preparation. Returns immediately with the queued job's status.
@@ -788,6 +921,55 @@ impl Jobs {
         Ok(status)
     }
 
+    /// Accept a strategy simplification of a finished (or still queued/running) solve job.
+    /// Returns immediately with the queued job's status; the locks array is fetched with
+    /// `reportResult` once the job is `done`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Jobs::submit_report`], plus a `player` that is not 0 or 1, a `grid` outside
+    /// `1..=64`, a `maxBoardCards` outside `3..=5`, or a `purifyThreshold` outside `0.5..=1`.
+    pub fn submit_simplify(&self, spec: SimplifySpec) -> Result<JobStatus, JobError> {
+        self.check_analysis_source(spec.job_id)?;
+        if spec.player > 1 {
+            return Err(JobError::BadPlayer(spec.player));
+        }
+        if spec.history.contains(&usize::MAX) {
+            return Err(JobError::BadHistory {
+                index: usize::MAX,
+                available: 0,
+            });
+        }
+        if !(1..=64).contains(&spec.grid) {
+            return Err(EngineError::Spot(crate::spot::SpotError::Amount {
+                field: "simplify.grid",
+                reason: "must be between 1 and 64".to_owned(),
+            })
+            .into());
+        }
+        if !(3..=5).contains(&spec.max_board_cards) {
+            return Err(EngineError::Spot(crate::spot::SpotError::Amount {
+                field: "simplify.maxBoardCards",
+                reason: "must be 3, 4 or 5".to_owned(),
+            })
+            .into());
+        }
+        if let Some(threshold) = spec.purify_threshold {
+            if !(0.5..=1.0).contains(&threshold) {
+                return Err(EngineError::Spot(crate::spot::SpotError::Amount {
+                    field: "simplify.purifyThreshold",
+                    reason: "must be between 0.5 and 1".to_owned(),
+                })
+                .into());
+            }
+        }
+
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let status = JobStatus::new_analysis(id, JobKind::Simplify, spec.job_id, None, None);
+        self.enqueue_analysis(id, Task::Simplify(spec), &status);
+        Ok(status)
+    }
+
     /// The synchronous half of analysis-source validation: everything checkable without the
     /// worker. The rest — a source forgotten while this job queued, a source with nothing left
     /// to reload — fails the job when it runs, mirroring a stale bunching reference.
@@ -811,6 +993,12 @@ impl Jobs {
                 return Err(JobError::NoTree {
                     id: source,
                     kind: "dump",
+                })
+            }
+            Task::Simplify(_) => {
+                return Err(JobError::NoTree {
+                    id: source,
+                    kind: "simplify",
                 })
             }
         }
@@ -849,18 +1037,19 @@ impl Jobs {
         self.shared.wake.notify_all();
     }
 
-    /// A done report job's result, served verbatim — small by design (tens of KB at most).
+    /// A done report or simplify job's result, served verbatim. Reports are small by design
+    /// (tens of KB at most); a simplify over a wide region can reach MBs.
     ///
     /// The result lives on the job row, untouched by `release` and the sweep (those reclaim
     /// trees); it disappears only with `forget`.
     ///
     /// # Errors
     ///
-    /// If the id is unknown, the job is not a report, or the report is not `done` — a cancelled
-    /// or failed report kept nothing.
+    /// If the id is unknown, the job is neither a report nor a simplify, or it is not `done` —
+    /// a cancelled or failed one kept nothing.
     pub fn report_result(&self, id: JobId) -> Result<serde_json::Value, JobError> {
         let job = self.job(id)?;
-        if !matches!(job.task, Task::Report(_)) {
+        if !matches!(job.task, Task::Report(_) | Task::Simplify(_)) {
             return Err(JobError::NotReport(id));
         }
         let phase = job.status.lock().unwrap().phase;
@@ -932,7 +1121,9 @@ impl Jobs {
     pub fn save(&self, id: JobId, path: &str) -> Result<JobStatus, JobError> {
         let job = self.job(id)?;
         match &job.task {
-            Task::Report(_) | Task::Dump(_) => return Err(JobError::NothingToSave(id)),
+            Task::Report(_) | Task::Dump(_) | Task::Simplify(_) => {
+                return Err(JobError::NothingToSave(id))
+            }
             Task::Solve(_) => {
                 let guard = job.game.lock().unwrap();
                 let game = guard.as_ref().ok_or(JobError::NothingToSave(id))?;
@@ -1109,7 +1300,9 @@ impl Jobs {
             compression_level: crate::spot::Spot::default_compression_level(),
             memo: Some(memo),
             // A reopened file's locks and tree edits live in the game itself (the engine
-            // serializes them); this placeholder spot is never used to rebuild.
+            // serializes them); this placeholder spot is never used to rebuild. The empty oop
+            // notation is also how `resolve` recognises an opened job and refuses it — if
+            // `open` ever synthesizes real ranges, that detection must move with it.
             added_lines: Vec::new(),
             removed_lines: Vec::new(),
             locks: Vec::new(),
@@ -1314,7 +1507,7 @@ fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
                 return;
             }
         }
-        Task::Report(_) | Task::Dump(_) => return,
+        Task::Report(_) | Task::Dump(_) | Task::Simplify(_) => return,
     }
     // Dropped outside both locks: freeing gigabytes is not instant and a `progress` query must not
     // queue behind it.
@@ -1421,6 +1614,7 @@ fn run_job(shared: &Arc<Shared>, job: &Arc<Job>) {
         Task::Bunching(spec) => run_bunching_job(shared, job, spec, started),
         Task::Report(spec) => run_report_job(shared, job, spec, started),
         Task::Dump(spec) => run_dump_job(shared, job, spec, started),
+        Task::Simplify(spec) => run_simplify_job(shared, job, spec, started),
     }
 }
 
@@ -1597,6 +1791,92 @@ fn run_dump_job(shared: &Arc<Shared>, job: &Arc<Job>, spec: &DumpSpec, started: 
     }
 }
 
+/// Run a simplify job: read the source's tree, round one player's strategy onto the grid,
+/// publish the locks array on the job row — [`run_report_job`]'s mirror in every lifecycle
+/// respect (guard held for the whole run, cancel publishes nothing, result lands in
+/// `report_result` before the terminal frame).
+fn run_simplify_job(shared: &Arc<Shared>, job: &Arc<Job>, spec: &SimplifySpec, started: Instant) {
+    let source = match source_for_analysis(shared, spec.job_id) {
+        Ok(source) => source,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let mut guard = match ensure_resident_game(shared, &source, spec.job_id) {
+        Ok(guard) => guard,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let game = guard
+        .as_mut()
+        .expect("ensure_resident_game only returns resident games");
+
+    {
+        let mut status = job.status.lock().unwrap();
+        status.phase = Phase::Running;
+        status.elapsed_ms = started.elapsed().as_millis() as u64;
+        let snapshot = status.clone();
+        drop(status);
+        shared.emit_status(&snapshot);
+    }
+
+    let mut last_emit = Instant::now();
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        analyze::run_simplify(game, spec, &job.cancel, &mut |nodes| {
+            let mut status = job.status.lock().unwrap();
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.nodes = nodes;
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Throttled exactly like solve and bunching progress.
+            let due = last_emit.elapsed() >= shared.throttle;
+            let snapshot = due.then(|| status.clone());
+            drop(status);
+            if let Some(snapshot) = snapshot {
+                last_emit = Instant::now();
+                shared.emit_status(&snapshot);
+            }
+        })
+    }));
+
+    match outcome {
+        Err(payload) => fail(shared, job, started, crate::describe_panic(&*payload)),
+        Ok(Err(AnalyzeError::Cancelled)) => {
+            // Nothing is published — a half-walked locks array is not an answer, and
+            // `reportResult` says `not_readable`; the report mirror.
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Cancelled;
+            status.stopped = Some(Stopped::Cancelled);
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
+        Ok(Err(e)) => fail(shared, job, started, e.to_string()),
+        Ok(Ok(result)) => {
+            let nodes_locked = result.nodes_locked;
+            let value = match serde_json::to_value(&result) {
+                Ok(value) => value,
+                Err(e) => {
+                    return fail(
+                        shared,
+                        job,
+                        started,
+                        format!("could not serialise the simplification: {e}"),
+                    )
+                }
+            };
+            // Published before the terminal frame, so a host that reacts to `done` by calling
+            // `reportResult` can never see the phase without the result.
+            *job.report_result.lock().unwrap() = Some(value);
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Done;
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.rows = Some(nodes_locked);
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
+    }
+}
+
 fn run_solve_job(shared: &Arc<Shared>, job: &Arc<Job>, spot: &Spot, started: Instant) {
     // Before allocating: hand back every tree that is already on disk. This is the difference
     // between an afternoon of solves costing one tree of memory and costing all of them.
@@ -1605,13 +1885,22 @@ fn run_solve_job(shared: &Arc<Shared>, job: &Arc<Job>, spot: &Spot, started: Ins
 
     // The reference is resolved fresh, here, rather than at submit: the preparation may not
     // even have run yet when the solve was queued (the FIFO guarantees it has by now), and a
-    // submit-time Arc would strand data behind a solve cancelled while queued.
+    // submit-time Arc would strand data behind a solve cancelled while queued. The one
+    // exception is a job created by `resolve`, which pre-seeds this slot with the Arc its
+    // source solve actually used — preferred over the reference, so the resolve still runs
+    // when the preparation job has been forgotten and had no file.
     let bunching = match &spot.bunching {
         None => None,
-        Some(bref) => match resolve_bunching(shared, bref, spot.max_memory_bytes) {
-            Ok(data) => Some(data),
-            Err(e) => return fail(shared, job, started, e.to_string()),
-        },
+        Some(bref) => {
+            let seeded = job.bunching_data.lock().unwrap().clone();
+            match seeded {
+                Some(data) => Some(data),
+                None => match resolve_bunching(shared, bref, spot.max_memory_bytes) {
+                    Ok(data) => Some(data),
+                    Err(e) => return fail(shared, job, started, e.to_string()),
+                },
+            }
+        }
     };
     if let Some(data) = &bunching {
         // Retained for the job's whole life — `release` drops only the tree — so the reload
@@ -1878,6 +2167,12 @@ fn ensure_resident_game<'a>(
         Task::Bunching(_) => return Err(JobError::NotBunchingReadable(id)),
         Task::Report(_) => return Err(JobError::NoTree { id, kind: "report" }),
         Task::Dump(_) => return Err(JobError::NoTree { id, kind: "dump" }),
+        Task::Simplify(_) => {
+            return Err(JobError::NoTree {
+                id,
+                kind: "simplify",
+            })
+        }
     }
     let (phase, saved_to) = {
         let status = job.status.lock().unwrap();

@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::analyze::{DumpSpec, ReportSpec};
+use crate::analyze::{DumpSpec, ReportSpec, SimplifySpec};
 use crate::engine::MemoryEstimate;
 use crate::jobs::{BestResponseView, JobError, JobId, JobStatus, Jobs, NodeView};
 use crate::spot::{BunchingRef, BunchingSpec, Spot};
@@ -142,6 +142,33 @@ pub enum Command {
     /// Queue a spot. Answers immediately with the queued job; the solving happens after.
     #[serde(rename = "solve", rename_all = "camelCase")]
     Solve { spot: Box<Spot> },
+    /// Re-solve a job's spot with modified locks and/or stop criteria, as a NEW job whose
+    /// status names its parent in `resolvedFrom`. The source job is untouched. Cold start:
+    /// tree rebuilt, iteration 0. The tree-defining fields (ranges, board, sizing, rake,
+    /// edits, compress, bunching, icm) are inherited and not overridable — change those with
+    /// `solve`. That is what keeps the source's and the resolve's `ev`/`exploitability`
+    /// comparable; but a lock change still moves the whole equilibrium, so compare EVs across
+    /// different locks only deliberately (the `simplify` cost measurement is that reading).
+    #[serde(rename = "resolve", rename_all = "camelCase")]
+    Resolve {
+        job_id: JobId,
+        /// Absent: inherit the source's locks. Present: replace wholesale (`[]` clears all
+        /// locks) — a host editing one lock resends them all.
+        #[serde(default)]
+        locks: Option<Vec<crate::spot::Lock>>,
+        /// Absent: inherit. Present: a full `Stop`; absent fields take the same serde
+        /// defaults a fresh `solve` gets, never the source's values.
+        #[serde(default)]
+        stop: Option<crate::spot::Stop>,
+        /// Never inherited: absent means this job keeps its answer in memory only.
+        /// (Inheriting would overwrite the source's saved file on completion.)
+        #[serde(default)]
+        save_path: Option<String>,
+        #[serde(default)]
+        max_memory_bytes: Option<u64>,
+        #[serde(default)]
+        memo: Option<String>,
+    },
     /// How big would this tree be? Builds it, does not allocate or solve it.
     #[serde(rename = "estimate", rename_all = "camelCase")]
     Estimate { spot: Box<Spot> },
@@ -248,9 +275,18 @@ pub enum Command {
     /// The result is fetched with `reportResult` once the job is `done`.
     #[serde(rename = "report", rename_all = "camelCase")]
     Report { report: Box<ReportSpec> },
-    /// A done report job's result. Small (tens of KB at most), served verbatim.
+    /// A done report or simplify job's result, served verbatim. Reports are small (tens of KB
+    /// at most); a simplify over a wide region can reach MBs.
     #[serde(rename = "reportResult", rename_all = "camelCase")]
     ReportResult { job_id: JobId },
+    /// Grid-round one player's strategy over a bounded region into a locks array, as a job.
+    ///
+    /// The result — fetched with `reportResult` once `done` — is `Spot::locks`-shaped, ready
+    /// to feed to `resolve`; the resolved job's `ev`/`exploitability` are the honest cost of
+    /// the simplification (its own deviation stats are only a free proxy). A job for the same
+    /// reason reports are: the per-node weight caching is O(#OOP × #IP) on a bunching source.
+    #[serde(rename = "simplify", rename_all = "camelCase")]
+    Simplify { simplify: Box<SimplifySpec> },
     /// Stream a finished solve's strategy to a JSON Lines file, as a job.
     ///
     /// Output size is the hazard, not traversal time: a mid-size flop tree is ~1 GB of JSON
@@ -340,6 +376,14 @@ impl OpError {
 pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpError> {
     let value = match command {
         Command::Solve { spot } => json(&jobs.submit(*spot)?)?,
+        Command::Resolve {
+            job_id,
+            locks,
+            stop,
+            save_path,
+            max_memory_bytes,
+            memo,
+        } => json(&jobs.resolve(job_id, locks, stop, save_path, max_memory_bytes, memo)?)?,
         Command::Estimate { spot } => {
             let estimate: MemoryEstimate =
                 crate::engine::estimate(&spot).map_err(JobError::Engine)?;
@@ -399,6 +443,7 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
         // changing it.
         Command::ReportResult { job_id } => jobs.report_result(job_id)?,
         Command::Dump { dump } => json(&jobs.submit_dump(*dump)?)?,
+        Command::Simplify { simplify } => json(&jobs.submit_simplify(*simplify)?)?,
         Command::Ping => serde_json::json!({ "pong": true }),
         Command::Version | Command::Shutdown => json(&version())?,
     };

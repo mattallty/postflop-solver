@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-pub use analyze::{DumpInclude, DumpSpec, ReportKind, ReportSpec};
+pub use analyze::{DumpInclude, DumpSpec, ReportKind, ReportSpec, SimplifyResult, SimplifySpec};
 pub use engine::{EngineError, MemoryEstimate, Sample, Solved, Stopped, DEFAULT_MEMORY_LIMIT};
 pub use jobs::{
     AnalysisStatus, BestResponseView, BunchingStatus, Emit, JobError, JobId, JobKind, JobStatus,
@@ -99,7 +99,7 @@ pub struct ErrorBody {
     /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`,
     /// `bad_player`, `engine`, `nothing_to_save`, `not_recoverable`, `not_finished`,
     /// `never_ran`, `not_bunching`, `bunching_not_ready`, `bunching_unavailable`, `not_report`,
-    /// `serialize`, or `panic`.
+    /// `not_resolvable`, `serialize`, or `panic`.
     pub code: String,
     pub message: String,
 }
