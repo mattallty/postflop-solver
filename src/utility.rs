@@ -279,6 +279,10 @@ pub fn finalize<T: Game>(game: &mut T) {
 }
 
 /// Computes the exploitability of the current strategy.
+///
+/// A raked or ICM game is not zero-sum (in chips resp. $), so the shortcut
+/// `(mes[0] + mes[1]) / 2` does not measure anything there; the current-EV-subtracting form is
+/// used instead, and the result is in the game's payoff unit ($ under ICM).
 #[inline]
 pub fn compute_exploitability<T: Game>(game: &T) -> f32 {
     if !game.is_ready() && !game.is_solved() {
@@ -286,7 +290,7 @@ pub fn compute_exploitability<T: Game>(game: &T) -> f32 {
     }
 
     let mes_ev = compute_mes_ev(game);
-    if !game.is_raked() {
+    if !game.is_raked() && !game.is_icm() {
         (mes_ev[0] + mes_ev[1]) * 0.5
     } else {
         let current_ev = compute_current_ev(game);
@@ -297,7 +301,9 @@ pub fn compute_exploitability<T: Game>(game: &T) -> f32 {
 /// Computes the expected values of the current strategy of each player.
 ///
 /// The bias, i.e., (starting pot) / 2, is already subtracted to increase the significant figures.
-/// This treatment makes the return value zero-sum when not raked.
+/// This treatment makes the return value zero-sum when not raked. Under ICM, the values are $
+/// deltas from each player's street-start ICM baseline (the exact analog of the chip bias) and
+/// are not zero-sum.
 #[inline]
 pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
     if !game.is_ready() && !game.is_solved() {
@@ -330,7 +336,9 @@ pub fn compute_current_ev<T: Game>(game: &T) -> [f32; 2] {
 /// Computes the expected values of the MES (Maximally Exploitative Strategy) of each player.
 ///
 /// The bias, i.e., (starting pot) / 2, is already subtracted to increase the significant figures.
-/// Therefore, the average of the return value corresponds to the exploitability value if not raked.
+/// Therefore, the average of the return value corresponds to the exploitability value if not
+/// raked and not ICM. Under ICM, the values are $ deltas from each player's street-start ICM
+/// baseline, like [`compute_current_ev`].
 #[inline]
 pub fn compute_mes_ev<T: Game>(game: &T) -> [f32; 2] {
     if !game.is_ready() && !game.is_solved() {

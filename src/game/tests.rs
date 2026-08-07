@@ -5,7 +5,7 @@ use crate::save_data_into_std_write;
 use crate::solver::*;
 use crate::utility::*;
 use crate::BunchingData;
-use crate::{load_data_from_std_read, BetSizeOptions};
+use crate::{icm_equity, icm_pot_value, load_data_from_std_read, BetSizeOptions};
 use std::collections::HashSet;
 
 #[test]
@@ -2343,4 +2343,681 @@ fn br_expected_values_detail_requires_detail() {
     let br = game.compute_best_response(0, false);
     game.cache_normalized_weights();
     game.br_expected_values_detail(&br);
+}
+
+/// A permutation-sum Malmuth–Harville, for cross-checking the subset DP. Exponential — test
+/// sizes only.
+fn brute_force_icm_equity(payouts: &[f64], stacks: &[f64]) -> Vec<f64> {
+    fn recurse(
+        payouts: &[f64],
+        stacks: &[f64],
+        remaining: &[usize],
+        place: usize,
+        prob: f64,
+        equity: &mut [f64],
+    ) {
+        if place >= payouts.len() || remaining.is_empty() {
+            return;
+        }
+        let total: f64 = remaining.iter().map(|&i| stacks[i]).sum();
+        for (pos, &i) in remaining.iter().enumerate() {
+            let p = if total > 0.0 {
+                prob * stacks[i] / total
+            } else {
+                prob / remaining.len() as f64
+            };
+            if p == 0.0 {
+                continue;
+            }
+            equity[i] += payouts[place] * p;
+            let mut rest = remaining.to_vec();
+            rest.remove(pos);
+            recurse(payouts, stacks, &rest, place + 1, p, equity);
+        }
+    }
+
+    let mut equity = vec![0.0; stacks.len()];
+    let players: Vec<usize> = (0..stacks.len()).collect();
+    recurse(payouts, stacks, &players, 0, 1.0, &mut equity);
+    equity
+}
+
+#[test]
+fn icm_equity_matches_brute_force_permutations() {
+    let cases: &[(&[f64], &[f64])] = &[
+        (&[100.0, 60.0], &[50.0, 30.0, 20.0]),
+        (&[100.0, 60.0, 40.0], &[500.0, 300.0, 150.0, 50.0]),
+        (&[90.0, 50.0, 30.0], &[970.0, 1030.0, 480.0, 2520.0, 310.0]),
+        (&[75.0], &[10.0, 20.0, 30.0, 25.0, 15.0]),
+        // a busted seat, the shape every all-in terminal produces
+        (&[100.0, 60.0, 40.0], &[700.0, 0.0, 300.0]),
+        (&[100.0, 60.0], &[1.0, 2.0, 4.0, 8.0, 16.0]),
+    ];
+
+    for (payouts, stacks) in cases {
+        let dp = icm_equity(payouts, stacks);
+        let brute = brute_force_icm_equity(payouts, stacks);
+        for (seat, (&a, &b)) in dp.iter().zip(brute.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "payouts {payouts:?}, stacks {stacks:?}, seat {seat}: DP {a} vs brute {b}"
+            );
+        }
+    }
+}
+
+/// A heads-up ICM configuration whose numbers are checkable by hand: equity is linear in
+/// chips, `eq_i = 60 + 40 * v_i / 2000` at these stacks.
+fn icm_heads_up_config() -> IcmConfig {
+    IcmConfig {
+        payouts: vec![100.0, 60.0],
+        stacks: vec![970.0, 970.0],
+        oop_seat: 0,
+        ip_seat: 1,
+    }
+}
+
+#[test]
+fn icm_two_player_terminal_dollars_are_hand_checkable() {
+    // The always-win spot: AA versus a crushed range on AcAdKh, no betting.
+    let lose_range_str = "KK-22,K9-K2,Q8-Q2,J8-J2,T8-T2,92+,82+,72+,62+";
+    let card_config = CardConfig {
+        range: ["AA".parse().unwrap(), lose_range_str.parse().unwrap()],
+        flop: flop_from_str("AcAdKh").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 60,
+        effective_stack: 970,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.set_icm_effect(&icm_heads_up_config()).unwrap();
+
+    // By hand: T = 2000 chips, $ per chip = (100 - 60) / 2000 = 0.02.
+    // Baseline: both stacks 1000 after the even pot split, so base = 60 + 1000 * 0.02 = 80.
+    // OOP always wins the 60-chip pot: 1030 chips = $80.6 absolute, a delta of +$0.6.
+    let state = game.icm.as_ref().unwrap();
+    assert!((state.base[0] - 80.0).abs() < 1e-9);
+    assert!((state.base[1] - 80.0).abs() < 1e-9);
+    let payoff = &state.payoffs[&0];
+    assert!((payoff[0].win - 0.6).abs() < 1e-9);
+    assert!((payoff[0].lose - -0.6).abs() < 1e-9);
+    assert!((payoff[1].win - 0.6).abs() < 1e-9);
+    assert!((payoff[1].lose - -0.6).abs() < 1e-9);
+    // Unraked: the tie vector is the baseline vector, exactly.
+    assert!(payoff[0].tie == 0.0 && payoff[1].tie == 0.0);
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    let current_ev = compute_current_ev(&game);
+    assert!((current_ev[0] - 0.6).abs() < 1e-5);
+    assert!((current_ev[1] - -0.6).abs() < 1e-5);
+    // Heads up, unraked ICM is exactly zero-sum: equity is linear in chips.
+    assert!((current_ev[0] + current_ev[1]).abs() < 1e-6);
+
+    // The display path answers absolute tournament $EV.
+    game.cache_normalized_weights();
+    let ev_oop = compute_average(&game.expected_values(0), game.normalized_weights(0));
+    let ev_ip = compute_average(&game.expected_values(1), game.normalized_weights(1));
+    assert!((ev_oop - 80.6).abs() < 1e-4);
+    assert!((ev_ip - 79.4).abs() < 1e-4);
+
+    // A chip flip is worth the average: the always-tie spot lands exactly on the baseline.
+    let card_config = CardConfig {
+        range: ["AA".parse().unwrap(), "AA".parse().unwrap()],
+        flop: flop_from_str("2c6dTh").unwrap(),
+        ..Default::default()
+    };
+    let tree_config = TreeConfig {
+        starting_pot: 60,
+        effective_stack: 970,
+        ..Default::default()
+    };
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.set_icm_effect(&icm_heads_up_config()).unwrap();
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    game.cache_normalized_weights();
+    let ev_oop = compute_average(&game.expected_values(0), game.normalized_weights(0));
+    let ev_ip = compute_average(&game.expected_values(1), game.normalized_weights(1));
+    assert!((ev_oop - 80.0).abs() < 1e-4);
+    assert!((ev_ip - 80.0).abs() < 1e-4);
+}
+
+#[test]
+fn icm_with_rake_takes_the_three_pass_branch_with_hand_checked_values() {
+    // Always-tie on 3-max stacks. (Heads up with equal stacks, symmetric rake would cancel:
+    // Malmuth–Harville measures shares of the pool, and burning chips evenly changes no
+    // share. A bystander who does not pay the rake is what makes the tie payoff nonzero —
+    // and forces the 3-pass showdown branch.)
+    let card_config = CardConfig {
+        range: ["AA".parse().unwrap(), "AA".parse().unwrap()],
+        flop: flop_from_str("2c6dTh").unwrap(),
+        ..Default::default()
+    };
+
+    let tree_config = TreeConfig {
+        starting_pot: 200,
+        effective_stack: 900,
+        rake_rate: 0.05,
+        rake_cap: 10.0,
+        ..Default::default()
+    };
+
+    let icm = icm_three_max_config();
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+    game.set_icm_effect(&icm).unwrap();
+
+    // By hand: P = 200, rake = min(200 * 0.05, 10) = 10. Baseline stacks [1000, 1500, 2500];
+    // a tie at amount 0 leaves [995, 1495, 2500]; a win takes 190 on top of 900.
+    let base_equity = icm_equity(&icm.payouts, &[1000.0, 1500.0, 2500.0]);
+    let tie_equity = icm_equity(&icm.payouts, &[995.0, 1495.0, 2500.0]);
+    let oop_wins_equity = icm_equity(&icm.payouts, &[1090.0, 1400.0, 2500.0]);
+    let ip_wins_equity = icm_equity(&icm.payouts, &[900.0, 1590.0, 2500.0]);
+
+    let state = game.icm.as_ref().unwrap();
+    let payoff = &state.payoffs[&0];
+    assert!(
+        payoff[0].tie != 0.0,
+        "rake must make the tie payoff nonzero"
+    );
+    assert!((payoff[0].tie - (tie_equity[0] - base_equity[0])).abs() < 1e-12);
+    assert!((payoff[1].tie - (tie_equity[1] - base_equity[1])).abs() < 1e-12);
+    assert!((payoff[0].win - (oop_wins_equity[0] - base_equity[0])).abs() < 1e-12);
+    assert!((payoff[0].lose - (ip_wins_equity[0] - base_equity[0])).abs() < 1e-12);
+    assert!((payoff[1].win - (ip_wins_equity[1] - base_equity[1])).abs() < 1e-12);
+    assert!((payoff[1].lose - (oop_wins_equity[1] - base_equity[1])).abs() < 1e-12);
+
+    game.allocate_memory(false);
+    finalize(&mut game);
+
+    // Every showdown ties, so the absolute $EV is exactly the tie equity.
+    game.cache_normalized_weights();
+    let ev_oop = compute_average(&game.expected_values(0), game.normalized_weights(0));
+    let ev_ip = compute_average(&game.expected_values(1), game.normalized_weights(1));
+    assert!((ev_oop - tie_equity[0] as f32).abs() < 1e-4);
+    assert!((ev_ip - tie_equity[1] as f32).abs() < 1e-4);
+}
+
+/// The spec's 3-max situation: two short-ish contestants and a big-stacked bystander.
+fn icm_three_max_config() -> IcmConfig {
+    IcmConfig {
+        payouts: vec![50.0, 30.0, 20.0],
+        stacks: vec![900.0, 1400.0, 2500.0],
+        oop_seat: 0,
+        ip_seat: 1,
+    }
+}
+
+/// A hand-enumerable river game on the 3-max ICM stacks (pot 200, effective stack 900).
+fn icm_river_game() -> PostFlopGame {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK,QQ".parse::<Range>().unwrap(),
+            "JJ,TT".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 200,
+        effective_stack: 900,
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%", "3x")).unwrap(),
+            BetSizeOptions::try_from(("50%", "3x")).unwrap(),
+        ],
+        add_allin_threshold: 1.5,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    PostFlopGame::with_config(card_config, action_tree).unwrap()
+}
+
+#[test]
+fn icm_terminal_payoffs_conserve_the_prize_pool() {
+    // The identity that replaces zero-sum: at every terminal event, the $ the contestants
+    // gain or lose relative to their baselines is exactly offset by the bystanders' equity
+    // shift — Malmuth–Harville conserves the prize pool. Heads up there is no bystander and
+    // the game is zero-sum; with one, the contestants' deltas sum to minus the bystander's.
+    let icm = icm_three_max_config();
+    let mut game = icm_river_game();
+    game.set_icm_effect(&icm).unwrap();
+
+    let state = game.icm.as_ref().unwrap();
+    let starting_pot = 200.0;
+    let bystander = 2;
+
+    let mut base_stacks = icm.stacks.clone();
+    base_stacks[icm.oop_seat] += 0.5 * starting_pot;
+    base_stacks[icm.ip_seat] += 0.5 * starting_pot;
+    let base_equity = icm_equity(&icm.payouts, &base_stacks);
+
+    assert!(!state.payoffs.is_empty());
+    for (&amount, payoff) in &state.payoffs {
+        let bet = amount as f64;
+        let pot = starting_pot + 2.0 * bet;
+
+        // Unraked ICM keeps the exact-zero tie payoff (and with it the 2-pass showdown).
+        assert!(payoff[0].tie == 0.0 && payoff[1].tie == 0.0);
+
+        let mut oop_wins = icm.stacks.clone();
+        oop_wins[icm.oop_seat] += pot - bet;
+        oop_wins[icm.ip_seat] -= bet;
+        let oop_wins_equity = icm_equity(&icm.payouts, &oop_wins);
+
+        let bystander_delta = oop_wins_equity[bystander] - base_equity[bystander];
+        let contestant_delta = payoff[0].win + payoff[1].lose;
+        assert!(
+            (contestant_delta + bystander_delta).abs() < 1e-9,
+            "amount {amount}: contestants {contestant_delta} vs bystander {bystander_delta}"
+        );
+        // And the bystander genuinely moves: an all-in bust hands them real equity, which is
+        // what makes the game non-zero-sum for the contestants.
+        if amount == 900 {
+            assert!(bystander_delta.abs() > 0.1);
+        }
+    }
+}
+
+#[test]
+fn icm_solve_is_the_chip_solve_under_linear_payoffs() {
+    // Heads up with the prize gap equal to the chips in play, a dollar is a chip: the solve
+    // must reproduce the chip-mode strategy, and every $ number is the chip number scaled by
+    // (p1 - p2) / T. Here the scale is kept at 1 to make the comparison exact.
+    let total_chips = 300.0 + 300.0 + 60.0;
+    let icm = IcmConfig {
+        payouts: vec![total_chips, 0.0],
+        stacks: vec![300.0, 300.0],
+        oop_seat: 0,
+        ip_seat: 1,
+    };
+
+    let mut chip_game = tiny_river_game_unsolved();
+    chip_game.allocate_memory(false);
+    solve(&mut chip_game, 200, 0.0, false);
+
+    let mut icm_game = tiny_river_game_unsolved();
+    icm_game.set_icm_effect(&icm).unwrap();
+    icm_game.allocate_memory(false);
+    solve(&mut icm_game, 200, 0.0, false);
+
+    // Same strategy at the root (regret matching is invariant under utility scaling, and the
+    // scale is 1 anyway)...
+    let chip_strategy = chip_game.strategy();
+    let icm_strategy = icm_game.strategy();
+    for (a, b) in chip_strategy.iter().zip(icm_strategy.iter()) {
+        assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+    }
+
+    // ... the same root EV deltas (the ICM baseline is T/2 + stack = everyone's chip stake,
+    // so deltas coincide with the chip bias convention) ...
+    let chip_ev = compute_current_ev(&chip_game);
+    let icm_ev = compute_current_ev(&icm_game);
+    assert!(
+        (chip_ev[0] - icm_ev[0]).abs() < 1e-3,
+        "{chip_ev:?} vs {icm_ev:?}"
+    );
+    assert!((chip_ev[1] - icm_ev[1]).abs() < 1e-3);
+
+    // ... and the same exploitability, though it flows through the current-EV branch.
+    let chip_exploitability = compute_exploitability(&chip_game);
+    let icm_exploitability = compute_exploitability(&icm_game);
+    assert!((chip_exploitability - icm_exploitability).abs() < 1e-3);
+
+    // The pot-value helper agrees that a chip is a dollar here.
+    assert!((icm_pot_value(&icm, 60) - 60.0).abs() < 1e-9);
+}
+
+#[test]
+fn icm_exploitability_converges_through_the_current_ev_branch() {
+    let mut game = icm_river_game();
+    game.set_icm_effect(&icm_three_max_config()).unwrap();
+    game.allocate_memory(false);
+
+    let pot_value = icm_pot_value(&icm_three_max_config(), 200);
+    assert!(pot_value > 0.0);
+
+    solve(&mut game, 2000, (pot_value * 0.001) as f32, false);
+
+    // The game is genuinely non-zero-sum in $: the current EVs do not cancel...
+    let current_ev = compute_current_ev(&game);
+    assert!(
+        (current_ev[0] + current_ev[1]).abs() > 1e-4,
+        "expected a non-zero-sum game, got {current_ev:?}"
+    );
+
+    // ... so the naive (mes0 + mes1) / 2 is broken here, and the raked-style branch is the
+    // one that measures convergence. It converged.
+    let exploitability = compute_exploitability(&game);
+    assert!(
+        exploitability <= (pot_value * 0.001) as f32,
+        "exploitability {exploitability} did not reach 0.1% of the pot value {pot_value}"
+    );
+
+    let mes_ev = compute_mes_ev(&game);
+    let naive = (mes_ev[0] + mes_ev[1]) * 0.5;
+    let honest = ((mes_ev[0] - current_ev[0]) + (mes_ev[1] - current_ev[1])) * 0.5;
+    assert!((exploitability - honest).abs() < 1e-6);
+    assert!(
+        (naive - honest).abs() > 1e-4,
+        "naive {naive} vs honest {honest}"
+    );
+}
+
+#[test]
+fn icm_expected_values_are_absolute_dollars() {
+    let mut game = icm_river_game();
+    game.set_icm_effect(&icm_three_max_config()).unwrap();
+    game.allocate_memory(false);
+    solve(&mut game, 500, 0.005, false);
+
+    let current_ev = compute_current_ev(&game);
+    let base = {
+        let state = game.icm.as_ref().unwrap();
+        state.base
+    };
+
+    game.cache_normalized_weights();
+    for player in 0..2 {
+        // The root range-weighted average of the absolute $ EVs is the $ delta plus the
+        // baseline — the display path and the solver-facing path agree.
+        let ev = compute_average(
+            &game.expected_values(player),
+            game.normalized_weights(player),
+        );
+        let expected = current_ev[player] + base[player] as f32;
+        assert!(
+            (ev - expected).abs() < 1e-3,
+            "player {player}: {ev} vs {expected}"
+        );
+
+        // expected_values is the strategy-weighted average of expected_values_detail.
+        if player == game.current_player() {
+            let detail = game.expected_values_detail(player);
+            let strategy = game.strategy();
+            let num_hands = game.num_private_hands(player);
+            let ev_by_hand = game.expected_values(player);
+            for hand in 0..num_hands {
+                let mut avg = 0.0;
+                for action in 0..detail.len() / num_hands {
+                    avg += detail[action * num_hands + hand] * strategy[action * num_hands + hand];
+                }
+                assert!((avg - ev_by_hand[hand]).abs() < 1e-2);
+            }
+        }
+    }
+}
+
+/// A view of a solved game that `finalize` accepts again — the engine-side mirror of the
+/// sidecar's `Refinalize` wrapper, needed because the decoder restores stored EVs with plain
+/// chip evaluation before any runtime effect can be re-applied.
+struct Refinalize<'a>(&'a mut PostFlopGame);
+
+impl Game for Refinalize<'_> {
+    type Node = PostFlopNode;
+
+    fn root(&self) -> MutexGuardLike<'_, Self::Node> {
+        self.0.root()
+    }
+
+    fn num_private_hands(&self, player: usize) -> usize {
+        self.0.num_private_hands(player)
+    }
+
+    fn initial_weights(&self, player: usize) -> &[f32] {
+        self.0.initial_weights(player)
+    }
+
+    fn evaluate(
+        &self,
+        result: &mut [std::mem::MaybeUninit<f32>],
+        node: &Self::Node,
+        player: usize,
+        cfreach: &[f32],
+    ) {
+        self.0.evaluate(result, node, player, cfreach);
+    }
+
+    fn chance_factor(&self, node: &Self::Node) -> usize {
+        self.0.chance_factor(node)
+    }
+
+    fn is_solved(&self) -> bool {
+        false
+    }
+
+    fn set_solved(&mut self) {}
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn is_raked(&self) -> bool {
+        self.0.is_raked()
+    }
+
+    fn is_icm(&self) -> bool {
+        self.0.is_icm()
+    }
+
+    fn isomorphic_chances(&self, node: &Self::Node) -> &[u8] {
+        self.0.isomorphic_chances(node)
+    }
+
+    fn isomorphic_swap(&self, node: &Self::Node, index: usize) -> &[Vec<(u16, u16)>; 2] {
+        self.0.isomorphic_swap(node, index)
+    }
+
+    fn locking_strategy(&self, node: &Self::Node) -> &[f32] {
+        self.0.locking_strategy(node)
+    }
+
+    fn is_compression_enabled(&self) -> bool {
+        self.0.is_compression_enabled()
+    }
+}
+
+/// `tiny_river_game` without the allocate-and-finalize tail, for tests that want to install
+/// effects first.
+fn tiny_river_game_unsolved() -> PostFlopGame {
+    let card_config = CardConfig {
+        range: [
+            "AA,KK".parse::<Range>().unwrap(),
+            "QQ,JJ".parse::<Range>().unwrap(),
+        ],
+        flop: flop_from_str("Td9d6h").unwrap(),
+        turn: card_from_str("As").unwrap(),
+        river: card_from_str("2c").unwrap(),
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: 60,
+        effective_stack: 300,
+        river_bet_sizes: [
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+            BetSizeOptions::try_from(("50%", "")).unwrap(),
+        ],
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).unwrap();
+    PostFlopGame::with_config(card_config, action_tree).unwrap()
+}
+
+/// Root and one-action-in observations that must survive a save/load/reapply round trip.
+fn icm_observations(game: &mut PostFlopGame) -> (Vec<f32>, Vec<f32>, Vec<f32>, [f32; 2]) {
+    game.back_to_root();
+    game.cache_normalized_weights();
+    let root_ev = game.expected_values(game.current_player());
+    let root_strategy = game.strategy();
+    game.play(0);
+    game.cache_normalized_weights();
+    let next_ev = game.expected_values(game.current_player());
+    game.back_to_root();
+    (root_ev, root_strategy, next_ev, compute_current_ev(&*game))
+}
+
+#[test]
+fn icm_solve_survives_save_load_reapply_bit_for_bit() {
+    let icm = icm_three_max_config();
+    let mut game = icm_river_game();
+    game.set_icm_effect(&icm).unwrap();
+    game.allocate_memory(false);
+    solve(&mut game, 300, 0.001, false);
+
+    let before = icm_observations(&mut game);
+
+    let mut buffer = Vec::new();
+    save_data_into_std_write(&game, "", &mut buffer, None).unwrap();
+    let mut cursor = std::io::Cursor::new(&buffer);
+    let mut loaded: PostFlopGame = load_data_from_std_read(&mut cursor, None).unwrap().0;
+
+    // The file recorded nothing about ICM: the decoder restored the stored EVs with chip
+    // evaluation, so the reapply is set_icm_effect *plus* one re-finalize.
+    assert!(loaded.icm_config().is_none());
+    loaded.set_icm_effect(&icm).unwrap();
+    finalize(&mut Refinalize(&mut loaded));
+
+    let after = icm_observations(&mut loaded);
+    assert_eq!(before.0, after.0, "root EVs changed across the round trip");
+    assert_eq!(
+        before.1, after.1,
+        "the strategy changed across the round trip"
+    );
+    assert_eq!(before.2, after.2, "child EVs changed across the round trip");
+    assert_eq!(
+        before.3, after.3,
+        "current EV changed across the round trip"
+    );
+}
+
+#[test]
+fn icm_composes_with_bunching() {
+    let icm = icm_heads_up_config();
+    let flop = flop_from_str("Td9d6h").unwrap();
+
+    let build = || {
+        let card_config = CardConfig {
+            range: [
+                "AA,KK".parse::<Range>().unwrap(),
+                "QQ,JJ".parse::<Range>().unwrap(),
+            ],
+            flop,
+            turn: card_from_str("As").unwrap(),
+            river: card_from_str("2c").unwrap(),
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 60,
+            effective_stack: 970,
+            river_bet_sizes: [
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+                BetSizeOptions::try_from(("50%", "")).unwrap(),
+            ],
+            ..Default::default()
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        PostFlopGame::with_config(card_config, action_tree).unwrap()
+    };
+
+    let mut bunching_data = BunchingData::new(&["JJ+".parse().unwrap()], flop).unwrap();
+    bunching_data.process(false);
+
+    // Chip-mode bunching solve as the reference; the two effects are independent, and heads-up
+    // linear payouts make the ICM answer the chip answer.
+    let mut chip_game = build();
+    chip_game.set_bunching_effect(&bunching_data).unwrap();
+    chip_game.allocate_memory(false);
+    solve(&mut chip_game, 200, 0.0, false);
+
+    let linear_icm = IcmConfig {
+        payouts: vec![970.0 + 970.0 + 60.0, 0.0],
+        stacks: vec![970.0, 970.0],
+        oop_seat: 0,
+        ip_seat: 1,
+    };
+    let mut both_game = build();
+    both_game.set_bunching_effect(&bunching_data).unwrap();
+    both_game.set_icm_effect(&linear_icm).unwrap();
+    assert!(both_game.is_icm());
+    both_game.allocate_memory(false);
+    solve(&mut both_game, 200, 0.0, false);
+
+    let chip_ev = compute_current_ev(&chip_game);
+    let both_ev = compute_current_ev(&both_game);
+    assert!(
+        (chip_ev[0] - both_ev[0]).abs() < 1e-2,
+        "{chip_ev:?} vs {both_ev:?}"
+    );
+    assert!((chip_ev[1] - both_ev[1]).abs() < 1e-2);
+    for (a, b) in chip_game.strategy().iter().zip(both_game.strategy().iter()) {
+        assert!((a - b).abs() < 1e-3);
+    }
+
+    // The round trip with BOTH effects re-applied, one re-finalize at the end.
+    let before = icm_observations(&mut both_game);
+    let mut buffer = Vec::new();
+    save_data_into_std_write(&both_game, "", &mut buffer, None).unwrap();
+    let mut cursor = std::io::Cursor::new(&buffer);
+    let mut loaded: PostFlopGame = load_data_from_std_read(&mut cursor, None).unwrap().0;
+    loaded.set_bunching_effect(&bunching_data).unwrap();
+    loaded.set_icm_effect(&linear_icm).unwrap();
+    finalize(&mut Refinalize(&mut loaded));
+    let after = icm_observations(&mut loaded);
+    assert_eq!(before.0, after.0);
+    assert_eq!(before.1, after.1);
+    assert_eq!(before.2, after.2);
+    assert_eq!(before.3, after.3);
+    let _ = icm; // the heads-up helper is exercised by the other tests
+}
+
+#[test]
+fn icm_effect_lifecycle_mirrors_bunching() {
+    let mut game = icm_river_game();
+    assert!(game.icm_config().is_none());
+    assert!(!game.is_icm());
+
+    game.set_icm_effect(&icm_three_max_config()).unwrap();
+    assert!(game.is_icm());
+    assert_eq!(game.icm_config(), Some(&icm_three_max_config()));
+
+    // A mismatched configuration is refused before anything is touched: the previous effect
+    // stays in place.
+    let mut wrong = icm_three_max_config();
+    wrong.stacks[0] = 800.0;
+    let err = game.set_icm_effect(&wrong).unwrap_err();
+    assert!(err.contains("effective stack"), "{err}");
+    assert_eq!(game.icm_config(), Some(&icm_three_max_config()));
+
+    game.reset_icm_effect();
+    assert!(!game.is_icm());
+
+    // update_config resets the effect, like the bunching lifecycle.
+    game.set_icm_effect(&icm_three_max_config()).unwrap();
+    let fresh = icm_river_game();
+    let tree_config = fresh.tree_config().clone();
+    let card_config = fresh.card_config().clone();
+    game.update_config(card_config, ActionTree::new(tree_config).unwrap())
+        .unwrap();
+    assert!(game.icm_config().is_none());
+
+    // An uninitialized game refuses the effect.
+    let mut uninitialized = PostFlopGame::new();
+    let err = uninitialized
+        .set_icm_effect(&icm_three_max_config())
+        .unwrap_err();
+    assert!(err.contains("not successfully initialized"), "{err}");
 }

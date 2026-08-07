@@ -948,6 +948,16 @@ impl PostFlopGame {
         let total_bet_amount = self.total_bet_amount();
         let bias = (total_bet_amount[player] - total_bet_amount[player ^ 1]).max(0);
 
+        // In chip mode the de-bias addend is the "expected pot recovery" display convention
+        // (half the starting pot, the current bet, and the uncalled-bet correction). Under ICM
+        // the stored values are $ deltas from the per-player baseline, so adding the baseline
+        // back yields absolute tournament $EV directly; the chip addend is a chip-display
+        // artifact and does not apply.
+        let addend = match &self.icm {
+            Some(state) => state.base[player] as f32,
+            None => starting_pot as f32 * 0.5 + (self.node().amount + bias) as f32,
+        };
+
         ret.chunks_exact_mut(num_hands)
             .enumerate()
             .for_each(|(action, row)| {
@@ -961,7 +971,7 @@ impl PostFlopGame {
                             *v = 0.0;
                         } else {
                             *v *= normalizer * (w_raw / w_normalized);
-                            *v += starting_pot as f32 * 0.5 + (self.node().amount + bias) as f32;
+                            *v += addend;
                         }
                     });
             });

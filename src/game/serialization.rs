@@ -225,7 +225,7 @@ impl PostFlopGame {
         }
 
         // The reverse direction: every stored lock must belong to a locked node in the arena.
-        for (&index, _) in &self.locking_strategy {
+        for &index in self.locking_strategy.keys() {
             if index >= arena_len || !self.node_arena[index].lock().is_locked {
                 return Err(format!(
                     "corrupt file: a lock is stored for node {index}, which is not a locked \

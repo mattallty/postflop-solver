@@ -28,6 +28,12 @@
 //!   such as manipulating the probability distribution of the deck.
 //!   Note, however, that enabling the bunching effect increases the time complexity
 //!   of the evaluation at the terminal nodes and slows down the computation significantly.
+//! - **ICM (payout-adjusted) solving**: `PostFlopGame::set_icm_effect` maps chip outcomes at
+//!   the terminals to tournament $EV via the Malmuth–Harville model, so the solver optimizes
+//!   dollars instead of chips. Like the bunching effect, it is runtime state that is never
+//!   serialized: a loaded game must have the effect re-applied. An ICM game is not zero-sum in
+//!   $, so — exactly as for raked games — CFR converges to a weaker equilibrium notion than
+//!   exact Nash, and the reported exploitability (in $) remains the honest quality signal.
 //!
 //! [Discounted CFR]: https://arxiv.org/abs/1809.04040
 //!
@@ -67,6 +73,7 @@ mod card;
 mod game;
 mod hand;
 mod hand_table;
+mod icm;
 mod interface;
 mod mutex_like;
 mod range;
@@ -82,6 +89,7 @@ pub use bet_size::*;
 pub use bunching::*;
 pub use card::*;
 pub use game::*;
+pub use icm::*;
 pub use interface::*;
 pub use mutex_like::*;
 pub use range::*;

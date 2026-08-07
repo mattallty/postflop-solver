@@ -54,6 +54,12 @@ pub trait Game: Send + Sync {
         false
     }
 
+    /// Returns whether the game maps chip outcomes to ICM $ payoffs.
+    #[doc(hidden)]
+    fn is_icm(&self) -> bool {
+        false
+    }
+
     /// Returns the list of indices that isomorphic chances refer to.
     #[doc(hidden)]
     fn isomorphic_chances(&self, _node: &Self::Node) -> &[u8] {

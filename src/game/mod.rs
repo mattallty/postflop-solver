@@ -14,6 +14,7 @@ mod tests;
 
 use crate::action_tree::*;
 use crate::card::*;
+use crate::icm::IcmConfig;
 use crate::mutex_like::*;
 use std::collections::BTreeMap;
 
@@ -82,6 +83,9 @@ pub struct PostFlopGame {
     bunching_coef_flop: [Vec<usize>; 2],
     bunching_coef_turn: [Vec<Vec<usize>>; 2],
 
+    // ICM effect (runtime state, like the bunching fields above: never serialized)
+    icm: Option<IcmState>,
+
     // store options
     storage_mode: BoardState,
     target_storage_mode: BoardState,
@@ -115,6 +119,27 @@ pub struct PostFlopGame {
     weights: [Vec<f32>; 2],
     normalized_weights: [Vec<f32>; 2],
     cfvalues_cache: [Vec<f32>; 2],
+}
+
+/// The three $ payoffs of one player at one terminal chip amount, as deltas from the player's
+/// ICM baseline (see [`IcmState::base`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IcmPayoff {
+    pub(super) win: f64,
+    pub(super) tie: f64,
+    pub(super) lose: f64,
+}
+
+/// The precomputed ICM effect. Never serialized — mirror of the bunching fields.
+pub(super) struct IcmState {
+    /// The configuration the tables were built from.
+    pub(super) config: IcmConfig,
+    /// Per-player baseline: the Malmuth–Harville $ equity of the street-start stacks with the
+    /// starting pot split evenly between the contestants — the ICM analog of the chip
+    /// convention's "(starting pot) / 2 is already subtracted".
+    pub(super) base: [f64; 2],
+    /// Per terminal `amount`, the two players' $ payoff deltas.
+    pub(super) payoffs: BTreeMap<i32, [IcmPayoff; 2]>,
 }
 
 /// A struct representing a node in a postflop game tree.

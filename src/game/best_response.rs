@@ -352,6 +352,13 @@ impl PostFlopGame {
         let total_bet_amount = self.total_bet_amount();
         let bias = (total_bet_amount[player] - total_bet_amount[player ^ 1]).max(0);
 
+        // The same de-bias convention as `expected_values_detail`: the chip "expected pot
+        // recovery" addend in chip mode, the absolute $ baseline under ICM.
+        let addend = match &self.icm {
+            Some(state) => state.base[player] as f32,
+            None => starting_pot as f32 * 0.5 + (node.amount + bias) as f32,
+        };
+
         values
             .chunks_exact_mut(num_hands)
             .enumerate()
@@ -366,7 +373,7 @@ impl PostFlopGame {
                             *v = 0.0;
                         } else {
                             *v *= normalizer * (w_raw / w_normalized);
-                            *v += starting_pot as f32 * 0.5 + (node.amount + bias) as f32;
+                            *v += addend;
                         }
                     });
             });

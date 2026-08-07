@@ -22,8 +22,20 @@ impl PostFlopGame {
         let pot = (self.tree_config.starting_pot + 2 * node.amount) as f64;
         let half_pot = 0.5 * pot;
         let rake = min(pot * self.tree_config.rake_rate, self.tree_config.rake_cap);
-        let amount_win = (half_pot - rake) / self.num_combinations;
-        let amount_lose = -half_pot / self.num_combinations;
+
+        // ICM substitutes the three payoff scalars per terminal node; the per-hand loops below
+        // are identical in both modes (one branch and one table lookup per node call).
+        let (payoff_win, payoff_lose, payoff_tie) = match &self.icm {
+            Some(state) => {
+                let payoff = &state.payoffs[&node.amount][player];
+                (payoff.win, payoff.lose, payoff.tie)
+            }
+            None => (half_pot - rake, -half_pot, -0.5 * rake),
+        };
+
+        let amount_win = payoff_win / self.num_combinations;
+        let amount_lose = payoff_lose / self.num_combinations;
+        let amount_tie = payoff_tie / self.num_combinations;
 
         let player_cards = &self.private_cards[player];
         let opponent_cards = &self.private_cards[player ^ 1];
@@ -91,8 +103,8 @@ impl PostFlopGame {
                 }
             }
         }
-        // showdown (optimized for no rake; 2-pass)
-        else if rake == 0.0 {
+        // showdown (optimized for zero tie payoff — unraked chips, and unraked ICM; 2-pass)
+        else if amount_tie == 0.0 {
             let pair_index = card_pair_to_index(node.turn, node.river);
             let hand_strength = &self.hand_strength[pair_index];
             let player_strength = &hand_strength[player];
@@ -149,9 +161,8 @@ impl PostFlopGame {
                 }
             }
         }
-        // showdown (raked; 3-pass)
+        // showdown (nonzero tie payoff; 3-pass)
         else {
-            let amount_tie = -0.5 * rake / self.num_combinations;
             let same_hand_index = &self.same_hand_index[player];
 
             let pair_index = card_pair_to_index(node.turn, node.river);
@@ -262,9 +273,19 @@ impl PostFlopGame {
         let pot = (self.tree_config.starting_pot + 2 * node.amount) as f64;
         let half_pot = 0.5 * pot;
         let rake = min(pot * self.tree_config.rake_rate, self.tree_config.rake_cap);
-        let amount_win = ((half_pot - rake) / self.bunching_num_combinations) as f32;
-        let amount_lose = (-half_pot / self.bunching_num_combinations) as f32;
-        let amount_tie = (-0.5 * rake / self.bunching_num_combinations) as f32;
+
+        // The same pre-loop scalar substitution as `evaluate_internal`.
+        let (payoff_win, payoff_lose, payoff_tie) = match &self.icm {
+            Some(state) => {
+                let payoff = &state.payoffs[&node.amount][player];
+                (payoff.win, payoff.lose, payoff.tie)
+            }
+            None => (half_pot - rake, -half_pot, -0.5 * rake),
+        };
+
+        let amount_win = (payoff_win / self.bunching_num_combinations) as f32;
+        let amount_lose = (payoff_lose / self.bunching_num_combinations) as f32;
+        let amount_tie = (payoff_tie / self.bunching_num_combinations) as f32;
         let opponent_len = self.private_cards[player ^ 1].len();
 
         // someone folded

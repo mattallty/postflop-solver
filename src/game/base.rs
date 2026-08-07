@@ -1,7 +1,9 @@
 use super::*;
 use crate::bunching::*;
+use crate::icm::*;
 use crate::interface::*;
 use crate::utility::*;
+use std::collections::BTreeSet;
 use std::mem::{self, MaybeUninit};
 
 #[cfg(feature = "rayon")]
@@ -79,6 +81,11 @@ impl Game for PostFlopGame {
     #[inline]
     fn is_raked(&self) -> bool {
         self.tree_config.rake_rate > 0.0 && self.tree_config.rake_cap > 0.0
+    }
+
+    #[inline]
+    fn is_icm(&self) -> bool {
+        self.icm.is_some()
     }
 
     #[inline]
@@ -167,6 +174,7 @@ impl PostFlopGame {
 
         self.init_interpreter();
         self.reset_bunching_effect();
+        self.reset_icm_effect();
 
         Ok(())
     }
@@ -197,6 +205,53 @@ impl PostFlopGame {
         self.set_bunching_effect_internal(bunching_data)?;
 
         Ok(())
+    }
+
+    /// Sets the ICM (payout-adjusted) effect configuration.
+    ///
+    /// Chip outcomes at every terminal are mapped to tournament $EV via the Malmuth–Harville
+    /// model (see [`IcmConfig`] and [`icm_equity`]), and everything downstream — the solve,
+    /// exploitability, and the expected-value read paths — operates in $ space. The stored
+    /// counterfactual
+    /// values become $ deltas from a per-player baseline (the street-start ICM equity with the
+    /// pot split evenly), the exact analog of the chip convention's "(starting pot) / 2 is
+    /// already subtracted".
+    ///
+    /// The effect is runtime state, like the bunching effect, and is **never serialized**: a
+    /// file saved from an ICM solve records nothing about it, and a loaded game reads back in
+    /// chip space unless the effect is re-applied — with the stored expected values then
+    /// recomputed, since the decoder restores them with chip evaluation. The cost of the
+    /// effect itself is negligible: one small table per distinct terminal amount, and the
+    /// terminal evaluation's per-hand loops are untouched.
+    ///
+    /// The current node will also be reset to the root.
+    pub fn set_icm_effect(&mut self, icm: &IcmConfig) -> Result<(), String> {
+        if self.state <= State::Uninitialized {
+            return Err("Game is not successfully initialized".to_string());
+        }
+
+        icm.validate(
+            self.tree_config.starting_pot,
+            self.tree_config.effective_stack,
+        )?;
+
+        self.reset_icm_effect();
+        self.set_icm_effect_internal(icm);
+
+        Ok(())
+    }
+
+    /// Resets the ICM effect configuration. The current node will also be reset to the root.
+    #[inline]
+    pub fn reset_icm_effect(&mut self) {
+        self.icm = None;
+        self.back_to_root();
+    }
+
+    /// Obtains the ICM configuration, if the ICM effect is set.
+    #[inline]
+    pub fn icm_config(&self) -> Option<&IcmConfig> {
+        self.icm.as_ref().map(|state| &state.config)
     }
 
     /// Resets the bunching effect configuration. The current node will also be reset to the root.
@@ -866,6 +921,92 @@ impl PostFlopGame {
 
         info.num_storage += node.num_elements as u64;
         info.num_storage_ip += node.num_elements_ip as u64;
+    }
+
+    /// Builds the per-terminal-amount ICM payoff tables. The configuration is already validated.
+    fn set_icm_effect_internal(&mut self, icm: &IcmConfig) {
+        let starting_pot = self.tree_config.starting_pot as f64;
+        let oop = icm.oop_seat;
+        let ip = icm.ip_seat;
+
+        // The baseline: street-start stacks with the pot split evenly between the contestants.
+        let mut base_stacks = icm.stacks.clone();
+        base_stacks[oop] += 0.5 * starting_pot;
+        base_stacks[ip] += 0.5 * starting_pot;
+        let base_equity = icm_equity(&icm.payouts, &base_stacks);
+        let base = [base_equity[oop], base_equity[ip]];
+
+        // Every terminal amount the evaluation can ever see is in the arena (built at
+        // `with_config` time and present after a load), so the table below is complete.
+        let mut amounts = BTreeSet::new();
+        for node in &self.node_arena {
+            let node = node.lock();
+            if node.is_terminal() {
+                amounts.insert(node.amount);
+            }
+        }
+
+        let mut payoffs = BTreeMap::new();
+        for &amount in &amounts {
+            let bet = amount as f64;
+            let pot = starting_pot + 2.0 * bet;
+            let raw_rake = pot * self.tree_config.rake_rate;
+            let rake = if raw_rake < self.tree_config.rake_cap {
+                raw_rake
+            } else {
+                self.tree_config.rake_cap
+            };
+
+            // The loser's stack `s - bet` bottoms out at exactly 0 on an all-in terminal:
+            // `validate` pinned the shorter contestant stack to the effective stack, and the
+            // tree cannot bet beyond it.
+            let mut oop_wins = icm.stacks.clone();
+            oop_wins[oop] += pot - bet - rake;
+            oop_wins[ip] -= bet;
+            let mut ip_wins = icm.stacks.clone();
+            ip_wins[ip] += pot - bet - rake;
+            ip_wins[oop] -= bet;
+            debug_assert!(oop_wins[ip] >= 0.0 && ip_wins[oop] >= 0.0);
+
+            let oop_wins_equity = icm_equity(&icm.payouts, &oop_wins);
+            let ip_wins_equity = icm_equity(&icm.payouts, &ip_wins);
+
+            // Unraked, the tie vector `s - bet + pot / 2` equals the baseline vector, so the
+            // baseline equity is reused: the tie payoff is then exactly 0.0 and the terminal
+            // evaluation keeps its fast 2-pass showdown path.
+            let tie_equity = if rake == 0.0 {
+                base_equity.clone()
+            } else {
+                let mut tie = icm.stacks.clone();
+                let gain = 0.5 * (pot - rake) - bet;
+                tie[oop] += gain;
+                tie[ip] += gain;
+                icm_equity(&icm.payouts, &tie)
+            };
+
+            payoffs.insert(
+                amount,
+                [
+                    IcmPayoff {
+                        win: oop_wins_equity[oop] - base[0],
+                        tie: tie_equity[oop] - base[0],
+                        lose: ip_wins_equity[oop] - base[0],
+                    },
+                    IcmPayoff {
+                        win: ip_wins_equity[ip] - base[1],
+                        tie: tie_equity[ip] - base[1],
+                        lose: oop_wins_equity[ip] - base[1],
+                    },
+                ],
+            );
+        }
+
+        self.icm = Some(IcmState {
+            config: icm.clone(),
+            base,
+            payoffs,
+        });
+        self.back_to_root();
     }
 
     /// Sets the bunching effect.
