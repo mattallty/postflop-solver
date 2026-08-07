@@ -685,7 +685,7 @@ fn render_line(line: &[Action]) -> String {
         return "(root)".to_owned();
     }
     line.iter()
-        .map(|a| crate::convert::action_to_string(a))
+        .map(crate::convert::action_to_string)
         .collect::<Vec<_>>()
         .join(", ")
 }
