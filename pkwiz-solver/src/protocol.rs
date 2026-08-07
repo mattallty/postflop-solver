@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analyze::{DumpSpec, ReportSpec};
 use crate::engine::MemoryEstimate;
 use crate::jobs::{BestResponseView, JobError, JobId, JobStatus, Jobs, NodeView};
 use crate::spot::{BunchingRef, BunchingSpec, Spot};
@@ -226,6 +227,23 @@ pub enum Command {
     /// range fields accept (notation or an explicit list).
     #[serde(rename = "range", rename_all = "camelCase")]
     Range { range: crate::spot::RangeSpec },
+    /// Aggregate a finished solve into a small report, as a job of its own.
+    ///
+    /// A job rather than a synchronous answer because a bunching source pushes the per-node
+    /// cost to O(#OOP × #IP) — tens of seconds — and `cancel`/`progress` must keep answering.
+    /// The result is fetched with `reportResult` once the job is `done`.
+    #[serde(rename = "report", rename_all = "camelCase")]
+    Report { report: Box<ReportSpec> },
+    /// A done report job's result. Small (tens of KB at most), served verbatim.
+    #[serde(rename = "reportResult", rename_all = "camelCase")]
+    ReportResult { job_id: JobId },
+    /// Stream a finished solve's strategy to a JSON Lines file, as a job.
+    ///
+    /// Output size is the hazard, not traversal time: a mid-size flop tree is ~1 GB of JSON
+    /// with strategy alone. `include`, `maxBoardCards`, `compress` and `maxBytes` are the
+    /// controls; the summary trailer is the completeness marker.
+    #[serde(rename = "dump", rename_all = "camelCase")]
+    Dump { dump: Box<DumpSpec> },
     /// Liveness check.
     #[serde(rename = "ping")]
     Ping,
@@ -361,6 +379,11 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
                 combos,
             })?
         }
+        Command::Report { report } => json(&jobs.submit_report(*report)?)?,
+        // Already a `Value`, served verbatim — re-encoding a finished report would only risk
+        // changing it.
+        Command::ReportResult { job_id } => jobs.report_result(job_id)?,
+        Command::Dump { dump } => json(&jobs.submit_dump(*dump)?)?,
         Command::Ping => serde_json::json!({ "pong": true }),
         Command::Version | Command::Shutdown => json(&version())?,
     };

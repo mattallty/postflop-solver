@@ -53,6 +53,19 @@
 //! reloaded game must have `set_bunching_effect` re-applied or it silently answers different
 //! numbers. That retained `Arc` pins ~62 MB per *distinct* preparation (shared across every
 //! solve that used it) until the solve jobs themselves are forgotten.
+//!
+//! # Analysis jobs, and what they hold
+//!
+//! A `report` or `dump` job ([`JobKind::Report`] / [`JobKind::Dump`]) owns no tree of its own —
+//! it reads a *source* solve job's game, holding that job's game lock for the whole run, which
+//! means `node` and `release` on the source block until the analysis finishes. The sweep does
+//! not: `release_recoverable` only *tries* each lock, so a tree an analysis is reading is
+//! skipped rather than waited for, and `open`/`solve` stay responsive during a minutes-long
+//! dump. A report's result is a small JSON value kept on the job row (`report_result`),
+//! untouched by `release` — only `forget` drops it; a dump's product is the file it wrote.
+//!
+//! The module's one lock order is game → bunching_data → best_response → report_result →
+//! status; nothing nests them the other way, which is what keeps the module deadlock-free.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -63,6 +76,7 @@ use std::time::{Duration, Instant};
 use postflop_solver::{Action, BestResponse, BunchingData, PostFlopGame};
 use serde::{Deserialize, Serialize};
 
+use crate::analyze::{self, AnalyzeError, DumpSpec, ReportKind, ReportSpec};
 use crate::engine::{self, EngineError, MemoryEstimate, Sample, Solved, Stopped};
 use crate::spot::{BunchingRef, BunchingSpec, Spot};
 
@@ -111,6 +125,10 @@ pub enum JobKind {
     Solve,
     /// A bunching-effect preparation.
     Bunching,
+    /// An aggregation report over a finished solve.
+    Report,
+    /// A full-tree strategy dump of a finished solve to a JSON Lines file.
+    Dump,
 }
 
 /// Progress and result of a bunching preparation — [`JobStatus::bunching`], on bunching jobs.
@@ -132,6 +150,29 @@ pub struct BunchingStatus {
     pub memory_bytes: Option<u64>,
 }
 
+/// Progress and identity of a report or dump job — [`JobStatus::analysis`], on those kinds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisStatus {
+    /// The solve job this analysis reads.
+    pub source_job_id: JobId,
+    /// Nodes processed so far (report: nodes read; dump: nodes visited).
+    pub nodes: u64,
+    /// Report jobs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_kind: Option<ReportKind>,
+    /// Report jobs, set at `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// Dump jobs: bytes written so far (pre-compression while running, the file's actual size
+    /// once `done`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    /// Dump jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// Everything a host needs to draw a progress bar and then a result.
 ///
 /// The same struct is the body of the `progress` response and of every pushed `job` event, so a
@@ -140,7 +181,9 @@ pub struct BunchingStatus {
 /// On a bunching job the solve-only fields hold inert values — `iterations` and
 /// `maxIterations` 0, `targetExploitability` 0.0, `startingPot` 0, empty `history` — and
 /// [`Self::bunching`] carries the progress; `stopped` stays `null` on `done` (why a *loop*
-/// ended is a solve concept) and is `cancelled` on a cancelled preparation.
+/// ended is a solve concept) and is `cancelled` on a cancelled preparation. Report and dump
+/// jobs hold the same inert values with [`Self::analysis`] carrying the progress; a finished
+/// dump also sets [`Self::saved_to`] to the file it wrote.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
@@ -177,6 +220,10 @@ pub struct JobStatus {
     pub history: Vec<Sample>,
     /// Preparation progress and result. `null` on solve jobs.
     pub bunching: Option<BunchingStatus>,
+    /// Progress and identity of a report or dump job. `null` on other kinds. `#[serde(default)]`
+    /// so frames stored before this field existed still deserialize.
+    #[serde(default)]
+    pub analysis: Option<AnalysisStatus>,
 }
 
 impl JobStatus {
@@ -199,6 +246,7 @@ impl JobStatus {
             error: None,
             history: Vec::new(),
             bunching: None,
+            analysis: None,
         }
     }
 
@@ -228,6 +276,45 @@ impl JobStatus {
                 flop,
                 memory_bytes: None,
             }),
+            analysis: None,
+        }
+    }
+
+    /// The queued status of a report or dump job — [`Self::new_bunching`]'s mirror: inert solve
+    /// fields, `bunching` null, [`Self::analysis`] carrying identity and zeroed progress.
+    fn new_analysis(
+        job_id: JobId,
+        kind: JobKind,
+        source_job_id: JobId,
+        report_kind: Option<ReportKind>,
+        path: Option<String>,
+    ) -> Self {
+        Self {
+            job_id,
+            kind,
+            phase: Phase::Queued,
+            iterations: 0,
+            max_iterations: 0,
+            exploitability: None,
+            target_exploitability: 0.0,
+            starting_pot: 0,
+            elapsed_ms: 0,
+            memory: None,
+            stopped: None,
+            ev: None,
+            saved_to: None,
+            resident: false,
+            error: None,
+            history: Vec::new(),
+            bunching: None,
+            analysis: Some(AnalysisStatus {
+                source_job_id,
+                nodes: 0,
+                report_kind,
+                rows: None,
+                bytes_written: path.is_some().then_some(0),
+                path,
+            }),
         }
     }
 }
@@ -251,19 +338,25 @@ impl Emit for Silent {
     fn emit(&self, _line: String) {}
 }
 
-/// What a job computes: a solve, or a bunching preparation. Internal — [`JobStatus`] stays the
-/// one wire shape either way. The spot is boxed because it dwarfs the other variant.
+/// What a job computes: a solve, a bunching preparation, or an analysis of a finished solve.
+/// Internal — [`JobStatus`] stays the one wire shape either way. The spot is boxed because it
+/// dwarfs the other variants.
 enum Task {
     Solve(Box<Spot>),
     Bunching(BunchingSpec),
+    Report(ReportSpec),
+    Dump(DumpSpec),
 }
 
 impl Task {
-    /// Fields both kinds share, so `save`, `node` and the reload path need not match twice.
+    /// Fields the kinds share, so `save`, `node` and the reload path need not match twice.
+    /// Analysis jobs never write engine files, so theirs are empty/`None`; the *source* job's
+    /// own cap and level govern its reload.
     fn memo(&self) -> &str {
         match self {
             Self::Solve(spot) => spot.memo.as_deref(),
             Self::Bunching(spec) => spec.memo.as_deref(),
+            Self::Report(_) | Self::Dump(_) => None,
         }
         .unwrap_or_default()
     }
@@ -272,6 +365,8 @@ impl Task {
         match self {
             Self::Solve(spot) => spot.compression_level,
             Self::Bunching(spec) => spec.compression_level,
+            Self::Report(_) => None,
+            Self::Dump(spec) => spec.compression_level,
         }
     }
 
@@ -279,6 +374,7 @@ impl Task {
         match self {
             Self::Solve(spot) => spot.max_memory_bytes,
             Self::Bunching(spec) => spec.max_memory_bytes,
+            Self::Report(_) | Self::Dump(_) => None,
         }
     }
 }
@@ -301,6 +397,11 @@ struct Job {
     /// of memory the release sweep exists to reclaim). Always `[None, None]` on a bunching
     /// job. Its place in the lock order is game → bunching_data → best_response → status.
     best_response: Mutex<[Option<Arc<BestResponse>>; 2]>,
+    /// On a report job: the finished result, published at `done`, served verbatim by
+    /// `reportResult`. Tens of KB at most, so `release` and the sweep leave it alone — only
+    /// `forget` drops it. Always `None` on other kinds. Locked between `best_response` and
+    /// `status` in the module's one lock order; nothing acquires `game` while holding it.
+    report_result: Mutex<Option<serde_json::Value>>,
 }
 
 struct Shared {
@@ -361,6 +462,12 @@ pub enum JobError {
     BunchingUnavailable { id: JobId, reason: String },
     #[error("player must be 0 (OOP) or 1 (IP), got {0}")]
     BadPlayer(usize),
+    #[error("job {id} is a {kind} job, which has no solved tree to read")]
+    NoTree { id: JobId, kind: &'static str },
+    #[error("job {0} is not a report job, so it has no report result")]
+    NotReport(JobId),
+    #[error("report {id} is {phase:?}; its result exists only once it is done")]
+    ReportNotReady { id: JobId, phase: Phase },
 }
 
 impl JobError {
@@ -383,6 +490,10 @@ impl JobError {
             Self::BunchingNotReady { .. } => "bunching_not_ready",
             Self::BunchingUnavailable { .. } => "bunching_unavailable",
             Self::BadPlayer(_) => "bad_player",
+            // Shares `not_readable` for the same reason `NotBunchingReadable` does: to a host,
+            // "this job (or this moment) has nothing to show" is one condition to branch on.
+            Self::NoTree { .. } | Self::ReportNotReady { .. } => "not_readable",
+            Self::NotReport(_) => "not_report",
         }
     }
 }
@@ -479,6 +590,7 @@ impl Jobs {
             game: Mutex::new(None),
             bunching_data: Mutex::new(None),
             best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
         });
 
         self.shared.jobs.lock().unwrap().insert(id, job);
@@ -517,6 +629,7 @@ impl Jobs {
             game: Mutex::new(None),
             bunching_data: Mutex::new(None),
             best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
         });
 
         self.shared.jobs.lock().unwrap().insert(id, job);
@@ -577,11 +690,166 @@ impl Jobs {
             game: Mutex::new(None),
             bunching_data: Mutex::new(Some(Arc::new(data))),
             best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
         });
         self.shared.jobs.lock().unwrap().insert(id, job);
         self.shared.emit_status(&status);
 
         Ok(status)
+    }
+
+    /// Accept an aggregation report over a finished (or still queued/running) solve job.
+    /// Returns immediately with the queued job's status.
+    ///
+    /// # Errors
+    ///
+    /// If the source job does not exist, is not a solve, or is terminal with nothing left to
+    /// read; or if the spec's `history`/`line` carry non-explicit indices. A queued or running
+    /// source is accepted — the FIFO guarantees it finishes before this job starts (the same
+    /// argument `submit`'s bunching reference makes).
+    pub fn submit_report(&self, spec: ReportSpec) -> Result<JobStatus, JobError> {
+        self.check_analysis_source(spec.job_id)?;
+        if spec.history.contains(&usize::MAX) || spec.line.contains(&usize::MAX) {
+            return Err(JobError::BadHistory {
+                index: usize::MAX,
+                available: 0,
+            });
+        }
+
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let status =
+            JobStatus::new_analysis(id, JobKind::Report, spec.job_id, Some(spec.kind), None);
+        self.enqueue_analysis(id, Task::Report(spec), &status);
+        Ok(status)
+    }
+
+    /// Accept a full-tree dump of a finished (or still queued/running) solve job to a JSON
+    /// Lines file. Returns immediately with the queued job's status.
+    ///
+    /// # Errors
+    ///
+    /// As [`Jobs::submit_report`], plus an empty `path` or a `maxBoardCards` outside `3..=5`.
+    pub fn submit_dump(&self, spec: DumpSpec) -> Result<JobStatus, JobError> {
+        self.check_analysis_source(spec.job_id)?;
+        if spec.history.contains(&usize::MAX) {
+            return Err(JobError::BadHistory {
+                index: usize::MAX,
+                available: 0,
+            });
+        }
+        if spec.path.is_empty() {
+            return Err(EngineError::Spot(crate::spot::SpotError::Amount {
+                field: "dump.path",
+                reason: "must name a file".to_owned(),
+            })
+            .into());
+        }
+        if !(3..=5).contains(&spec.max_board_cards) {
+            return Err(EngineError::Spot(crate::spot::SpotError::Amount {
+                field: "dump.maxBoardCards",
+                reason: "must be 3, 4 or 5".to_owned(),
+            })
+            .into());
+        }
+
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let status = JobStatus::new_analysis(
+            id,
+            JobKind::Dump,
+            spec.job_id,
+            None,
+            Some(spec.path.clone()),
+        );
+        self.enqueue_analysis(id, Task::Dump(spec), &status);
+        Ok(status)
+    }
+
+    /// The synchronous half of analysis-source validation: everything checkable without the
+    /// worker. The rest — a source forgotten while this job queued, a source with nothing left
+    /// to reload — fails the job when it runs, mirroring a stale bunching reference.
+    fn check_analysis_source(&self, source: JobId) -> Result<(), JobError> {
+        let job = self.job(source)?;
+        match &job.task {
+            Task::Solve(_) => {}
+            Task::Bunching(_) => {
+                return Err(JobError::NoTree {
+                    id: source,
+                    kind: "bunching",
+                })
+            }
+            Task::Report(_) => {
+                return Err(JobError::NoTree {
+                    id: source,
+                    kind: "report",
+                })
+            }
+            Task::Dump(_) => {
+                return Err(JobError::NoTree {
+                    id: source,
+                    kind: "dump",
+                })
+            }
+        }
+        let (phase, saved) = {
+            let status = job.status.lock().unwrap();
+            (status.phase, status.saved_to.is_some())
+        };
+        if phase.is_terminal() {
+            if !phase.is_readable() {
+                return Err(JobError::NotReadable { id: source, phase });
+            }
+            let has_game = job.game.lock().unwrap().is_some();
+            if !has_game && !saved {
+                // Cancelled while queued: no game was ever published and no file exists.
+                return Err(JobError::NeverRan(source));
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert an analysis job and wake the worker — `submit`'s tail, sharing its frame-ordering
+    /// rule: the `queued` frame is emitted before the worker can see the id.
+    fn enqueue_analysis(&self, id: JobId, task: Task, status: &JobStatus) {
+        let job = Arc::new(Job {
+            task,
+            cancel: AtomicBool::new(false),
+            status: Mutex::new(status.clone()),
+            game: Mutex::new(None),
+            bunching_data: Mutex::new(None),
+            best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
+        });
+        self.shared.jobs.lock().unwrap().insert(id, job);
+        self.shared.emit_status(status);
+        self.shared.queue.lock().unwrap().push_back(id);
+        self.shared.wake.notify_all();
+    }
+
+    /// A done report job's result, served verbatim — small by design (tens of KB at most).
+    ///
+    /// The result lives on the job row, untouched by `release` and the sweep (those reclaim
+    /// trees); it disappears only with `forget`.
+    ///
+    /// # Errors
+    ///
+    /// If the id is unknown, the job is not a report, or the report is not `done` — a cancelled
+    /// or failed report kept nothing.
+    pub fn report_result(&self, id: JobId) -> Result<serde_json::Value, JobError> {
+        let job = self.job(id)?;
+        if !matches!(job.task, Task::Report(_)) {
+            return Err(JobError::NotReport(id));
+        }
+        let phase = job.status.lock().unwrap().phase;
+        if phase != Phase::Done {
+            return Err(JobError::ReportNotReady { id, phase });
+        }
+        let result = job
+            .report_result
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a done report published its result before its terminal frame");
+        Ok(result)
     }
 
     /// Current status of one job.
@@ -635,10 +903,12 @@ impl Jobs {
     /// # Errors
     ///
     /// If the id is unknown, the job never produced anything (a cancelled preparation keeps
-    /// nothing, unlike a cancelled solve), or the file cannot be written.
+    /// nothing, unlike a cancelled solve; a report's result is already in the `reportResult`
+    /// response and a dump's file already exists), or the file cannot be written.
     pub fn save(&self, id: JobId, path: &str) -> Result<JobStatus, JobError> {
         let job = self.job(id)?;
         match &job.task {
+            Task::Report(_) | Task::Dump(_) => return Err(JobError::NothingToSave(id)),
             Task::Solve(_) => {
                 let guard = job.game.lock().unwrap();
                 let game = guard.as_ref().ok_or(JobError::NothingToSave(id))?;
@@ -660,7 +930,9 @@ impl Jobs {
     /// The job stays in the list, its status is untouched apart from
     /// [`JobStatus::resident`], and reading it again reloads the file. Releasing a job that is
     /// already released is a no-op rather than an error, so a host can call this without tracking
-    /// what it has already done.
+    /// what it has already done. Releasing a job whose tree a running report or dump is reading
+    /// is also a no-op — the release only *tries* the game lock — and the response's
+    /// `resident: true` says so; retry after the analysis job finishes.
     ///
     /// # Errors
     ///
@@ -828,6 +1100,7 @@ impl Jobs {
             game: Mutex::new(Some(game)),
             bunching_data: Mutex::new(data),
             best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
         });
         self.shared.jobs.lock().unwrap().insert(id, job);
         self.shared.emit_status(&status);
@@ -850,7 +1123,7 @@ impl Jobs {
     /// can no longer be read, or its bunching effect can no longer be re-established.
     pub fn node(&self, id: JobId, history: &[usize]) -> Result<NodeView, JobError> {
         let job = self.job(id)?;
-        let mut guard = self.ensure_resident_game(&job, id)?;
+        let mut guard = ensure_resident_game(&self.shared, &job, id)?;
         let game = guard
             .as_mut()
             .expect("ensure_resident_game only returns resident games");
@@ -884,7 +1157,7 @@ impl Jobs {
             return Err(JobError::BadPlayer(player));
         }
         let job = self.job(id)?;
-        let mut guard = self.ensure_resident_game(&job, id)?;
+        let mut guard = ensure_resident_game(&self.shared, &job, id)?;
         let game = guard
             .as_mut()
             .expect("ensure_resident_game only returns resident games");
@@ -901,74 +1174,6 @@ impl Jobs {
         };
 
         best_response_view(game, &br, history)
-    }
-
-    /// The shared front half of [`Jobs::node`] and [`Jobs::best_response`]: the readability
-    /// checks and the transparent reload of a released job. Factored so the two paths cannot
-    /// drift — a released *bunching* solve must have its effect re-applied before either reads
-    /// (or computes) anything, or it would silently answer non-bunching numbers.
-    ///
-    /// On success the returned guard is always `Some`.
-    fn ensure_resident_game<'a>(
-        &self,
-        job: &'a Arc<Job>,
-        id: JobId,
-    ) -> Result<std::sync::MutexGuard<'a, Option<PostFlopGame>>, JobError> {
-        if matches!(job.task, Task::Bunching(_)) {
-            return Err(JobError::NotBunchingReadable(id));
-        }
-        let (phase, saved_to) = {
-            let status = job.status.lock().unwrap();
-            (status.phase, status.saved_to.clone())
-        };
-        if !phase.is_readable() {
-            return Err(JobError::NotReadable { id, phase });
-        }
-
-        let mut guard = job.game.lock().unwrap();
-        if guard.is_none() {
-            // Released, or never published. Only the first is recoverable. The reload honours
-            // the same memory cap the job was allowed when it was built or opened.
-            // No game and no file: a job cancelled while still queued. (`Done` always has one
-            // or the other — the worker publishes the game before flipping the phase, and
-            // `release` refuses to drop an unsaved one.) The old `NotReadable` here produced a
-            // self-contradicting message: "is Cancelled; … can only be read once it has
-            // finished or been cancelled".
-            let path = saved_to.ok_or(JobError::NeverRan(id))?;
-            let mut game = engine::load(&path, job.task.max_memory_bytes())?.0;
-            // The file has no bunching field, so a game that was solved with it comes back
-            // *without* it here — re-applying (EVs included, see `engine::reapply_bunching`)
-            // is what keeps a released job's answers identical to its pre-release ones. Kept
-            // out of `*guard` until it succeeds: publishing the bare game on failure would
-            // answer the next read with silently different numbers, which is strictly worse
-            // than this error.
-            if let Task::Solve(spot) = &job.task {
-                if let Some(bref) = &spot.bunching {
-                    let wrap = |reason: String| JobError::BunchingUnavailable { id, reason };
-                    let data = {
-                        // The job's own retained Arc survives `release` and `forget` of the
-                        // preparation; the shared resolution path is only the fallback.
-                        let own = job.bunching_data.lock().unwrap().clone();
-                        match own {
-                            Some(data) => data,
-                            None => resolve_bunching(&self.shared, bref, spot.max_memory_bytes)
-                                .map_err(|e| wrap(e.to_string()))?,
-                        }
-                    };
-                    engine::reapply_bunching(&mut game, &data).map_err(wrap)?;
-                    *job.bunching_data.lock().unwrap() = Some(data);
-                }
-            }
-            *guard = Some(game);
-            // The status is updated while the game guard is still held: dropping it first
-            // would let `release_others` (from a concurrent `open`, or a solve starting) take
-            // the freshly loaded game in the gap, leaving `resident: true` with no game and
-            // turning this read into a bogus error. No deadlock: this game → status nesting is
-            // the one ordering the module uses, and no path acquires the game lock while
-            // holding a status lock.
-            job.status.lock().unwrap().resident = true;
-        }
-        Ok(guard)
     }
 
     /// Stop the worker after the job it is on. Idempotent.
@@ -1026,17 +1231,31 @@ impl Shared {
 /// effect, while the cache is strategy-sized — exactly the class of memory this sweep exists to
 /// reclaim — and is recomputed on demand.
 ///
+/// The lock is **tried, never waited for**: a game someone is actively holding — a report or
+/// dump reading its source for minutes — is exactly the wrong tree to release, and blocking
+/// here would freeze the session's `open`/`solve` sweep behind the analysis. On contention
+/// nothing changes and nothing is announced; the tree is released the usual way once its
+/// reader finishes and the next sweep runs. Report and dump jobs themselves hold nothing
+/// releasable.
+///
 /// The game (or data) guard is released before the status lock is taken. The module's one lock
-/// order is game → bunching_data → best_response → status (`ensure_resident_game`'s reload
-/// nests game → bunching_data → status, and `best_response` nests game → best_response);
-/// nothing nests them the other way, which is what keeps the module deadlock-free.
+/// order is game → bunching_data → best_response → report_result → status
+/// (`ensure_resident_game`'s reload nests game → bunching_data → status, and `best_response`
+/// nests game → best_response); nothing nests them the other way, which is what keeps the
+/// module deadlock-free.
 fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
     let dropped_game;
     let mut dropped_br = [None, None];
     let mut dropped_data = None;
     match &job.task {
         Task::Solve(_) => {
-            dropped_game = job.game.lock().unwrap().take();
+            let Ok(mut guard) = job.game.try_lock() else {
+                // In use — almost certainly by an analysis job reading it. Skipped, not waited
+                // for; the caller's `resident: true` answer tells the truth.
+                return;
+            };
+            dropped_game = guard.take();
+            drop(guard);
             if dropped_game.is_none() {
                 // Already released. Nothing changed, so nothing is announced.
                 return;
@@ -1045,11 +1264,16 @@ fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
         }
         Task::Bunching(_) => {
             dropped_game = None;
-            dropped_data = job.bunching_data.lock().unwrap().take();
+            let Ok(mut guard) = job.bunching_data.try_lock() else {
+                return;
+            };
+            dropped_data = guard.take();
+            drop(guard);
             if dropped_data.is_none() {
                 return;
             }
         }
+        Task::Report(_) | Task::Dump(_) => return,
     }
     // Dropped outside both locks: freeing gigabytes is not instant and a `progress` query must not
     // queue behind it.
@@ -1066,8 +1290,9 @@ fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
 
 /// Release every recoverable game, optionally sparing one.
 ///
-/// Called as a solve starts and as a file is opened — the two moments the process is about to hold
-/// a whole tree. `keep` is `None` when the job that is about to own one does not exist yet.
+/// Called as a solve starts, as a file is opened, and as an analysis acquires its source — the
+/// three moments the process is about to hold a whole tree. `keep` is `None` when the job that
+/// is about to own one does not exist yet.
 ///
 /// Bunching jobs are deliberately skipped: their 62 MB is two orders of magnitude below a tree,
 /// and a queued solve is often about to need exactly that data — sweeping it would trade a
@@ -1153,6 +1378,181 @@ fn run_job(shared: &Arc<Shared>, job: &Arc<Job>) {
     match &job.task {
         Task::Solve(spot) => run_solve_job(shared, job, spot, started),
         Task::Bunching(spec) => run_bunching_job(shared, job, spec, started),
+        Task::Report(spec) => run_report_job(shared, job, spec, started),
+        Task::Dump(spec) => run_dump_job(shared, job, spec, started),
+    }
+}
+
+/// Look up an analysis job's source row and sweep every other recoverable tree back to disk —
+/// the third "about to hold a whole tree" moment, after `solve` and `open`. The caller then
+/// acquires the source's game via [`ensure_resident_game`] and holds that guard for the
+/// analysis's whole run: `node` and `release` on the source job block until it finishes (the
+/// sweep does not — it only *tries* the lock).
+fn source_for_analysis(shared: &Arc<Shared>, source_id: JobId) -> Result<Arc<Job>, JobError> {
+    // Resolved fresh, here: the source may have been forgotten while this job queued — the
+    // mirror of a bunching reference going stale.
+    let source = shared
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&source_id)
+        .cloned()
+        .ok_or(JobError::NoSuchJob(source_id))?;
+    release_others(shared, Some(source_id));
+    Ok(source)
+}
+
+/// Run a report job: read the source's tree, aggregate, publish the result on the job row.
+fn run_report_job(shared: &Arc<Shared>, job: &Arc<Job>, spec: &ReportSpec, started: Instant) {
+    let source = match source_for_analysis(shared, spec.job_id) {
+        Ok(source) => source,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let mut guard = match ensure_resident_game(shared, &source, spec.job_id) {
+        Ok(guard) => guard,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let game = guard
+        .as_mut()
+        .expect("ensure_resident_game only returns resident games");
+
+    {
+        let mut status = job.status.lock().unwrap();
+        status.phase = Phase::Running;
+        status.elapsed_ms = started.elapsed().as_millis() as u64;
+        let snapshot = status.clone();
+        drop(status);
+        shared.emit_status(&snapshot);
+    }
+
+    let mut last_emit = Instant::now();
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        analyze::run_report(game, spec, &job.cancel, &mut |nodes| {
+            let mut status = job.status.lock().unwrap();
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.nodes = nodes;
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Throttled exactly like solve and bunching progress.
+            let due = last_emit.elapsed() >= shared.throttle;
+            let snapshot = due.then(|| status.clone());
+            drop(status);
+            if let Some(snapshot) = snapshot {
+                last_emit = Instant::now();
+                shared.emit_status(&snapshot);
+            }
+        })
+    }));
+
+    match outcome {
+        Err(payload) => fail(shared, job, started, crate::describe_panic(&*payload)),
+        Ok(Err(AnalyzeError::Cancelled)) => {
+            // Nothing is published — the mirror of a cancelled bunching preparation: a
+            // half-computed report is not an answer, and `reportResult` says `not_readable`.
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Cancelled;
+            status.stopped = Some(Stopped::Cancelled);
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
+        Ok(Err(e)) => fail(shared, job, started, e.to_string()),
+        Ok(Ok(result)) => {
+            let rows = result.rows();
+            let value = match serde_json::to_value(&result) {
+                Ok(value) => value,
+                Err(e) => {
+                    return fail(
+                        shared,
+                        job,
+                        started,
+                        format!("could not serialise the report: {e}"),
+                    )
+                }
+            };
+            // Published before the terminal frame, so a host that reacts to `done` by calling
+            // `reportResult` can never see the phase without the result.
+            *job.report_result.lock().unwrap() = Some(value);
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Done;
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.rows = Some(rows);
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
+    }
+}
+
+/// Run a dump job: stream the source's tree to the spec's file.
+fn run_dump_job(shared: &Arc<Shared>, job: &Arc<Job>, spec: &DumpSpec, started: Instant) {
+    let source = match source_for_analysis(shared, spec.job_id) {
+        Ok(source) => source,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let mut guard = match ensure_resident_game(shared, &source, spec.job_id) {
+        Ok(guard) => guard,
+        Err(e) => return fail(shared, job, started, e.to_string()),
+    };
+    let game = guard
+        .as_mut()
+        .expect("ensure_resident_game only returns resident games");
+
+    {
+        let mut status = job.status.lock().unwrap();
+        status.phase = Phase::Running;
+        status.elapsed_ms = started.elapsed().as_millis() as u64;
+        let snapshot = status.clone();
+        drop(status);
+        shared.emit_status(&snapshot);
+    }
+
+    let mut last_emit = Instant::now();
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        analyze::run_dump(game, spec, &job.cancel, &mut |nodes, bytes| {
+            let mut status = job.status.lock().unwrap();
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.nodes = nodes;
+                analysis.bytes_written = Some(bytes);
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            let due = last_emit.elapsed() >= shared.throttle;
+            let snapshot = due.then(|| status.clone());
+            drop(status);
+            if let Some(snapshot) = snapshot {
+                last_emit = Instant::now();
+                shared.emit_status(&snapshot);
+            }
+        })
+    }));
+
+    match outcome {
+        Err(payload) => fail(shared, job, started, crate::describe_panic(&*payload)),
+        Ok(Err(AnalyzeError::Cancelled)) => {
+            // The partial file is deliberately left on disk; its missing summary line is the
+            // documented incompleteness marker.
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Cancelled;
+            status.stopped = Some(Stopped::Cancelled);
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
+        // Failures — `maxBytes` exceeded, I/O, a bad base — also leave the partial file.
+        Ok(Err(e)) => fail(shared, job, started, e.to_string()),
+        Ok(Ok(summary)) => {
+            let mut status = job.status.lock().unwrap();
+            status.phase = Phase::Done;
+            status.saved_to = Some(spec.path.clone());
+            if let Some(analysis) = status.analysis.as_mut() {
+                analysis.nodes = summary.nodes;
+                analysis.bytes_written = Some(summary.bytes_written);
+            }
+            status.elapsed_ms = started.elapsed().as_millis() as u64;
+            // Emitted under the lock — see `Shared::emit_status`.
+            shared.emit_status(&status);
+        }
     }
 }
 
@@ -1414,6 +1814,78 @@ fn run_bunching_job(shared: &Arc<Shared>, job: &Arc<Job>, spec: &BunchingSpec, s
     status.elapsed_ms = started.elapsed().as_millis() as u64;
     // Emitted under the lock — see `Shared::emit_status`.
     shared.emit_status(&status);
+}
+
+/// The shared front half of [`Jobs::node`], [`Jobs::best_response`] and the analysis workers:
+/// the readability checks and the transparent reload of a released job. Factored so the paths
+/// cannot drift — a released *bunching* solve must have its effect re-applied before anything
+/// reads (or computes over) it, or it would silently answer non-bunching numbers. A free
+/// function rather than a method because the worker thread holds a `Shared`, not a `Jobs`.
+///
+/// On success the returned guard is always `Some`.
+fn ensure_resident_game<'a>(
+    shared: &Arc<Shared>,
+    job: &'a Arc<Job>,
+    id: JobId,
+) -> Result<std::sync::MutexGuard<'a, Option<PostFlopGame>>, JobError> {
+    match &job.task {
+        Task::Solve(_) => {}
+        Task::Bunching(_) => return Err(JobError::NotBunchingReadable(id)),
+        Task::Report(_) => return Err(JobError::NoTree { id, kind: "report" }),
+        Task::Dump(_) => return Err(JobError::NoTree { id, kind: "dump" }),
+    }
+    let (phase, saved_to) = {
+        let status = job.status.lock().unwrap();
+        (status.phase, status.saved_to.clone())
+    };
+    if !phase.is_readable() {
+        return Err(JobError::NotReadable { id, phase });
+    }
+
+    let mut guard = job.game.lock().unwrap();
+    if guard.is_none() {
+        // Released, or never published. Only the first is recoverable. The reload honours
+        // the same memory cap the job was allowed when it was built or opened.
+        // No game and no file: a job cancelled while still queued. (`Done` always has one
+        // or the other — the worker publishes the game before flipping the phase, and
+        // `release` refuses to drop an unsaved one.) The old `NotReadable` here produced a
+        // self-contradicting message: "is Cancelled; … can only be read once it has
+        // finished or been cancelled".
+        let path = saved_to.ok_or(JobError::NeverRan(id))?;
+        let mut game = engine::load(&path, job.task.max_memory_bytes())?.0;
+        // The file has no bunching field, so a game that was solved with it comes back
+        // *without* it here — re-applying (EVs included, see `engine::reapply_bunching`)
+        // is what keeps a released job's answers identical to its pre-release ones. Kept
+        // out of `*guard` until it succeeds: publishing the bare game on failure would
+        // answer the next read with silently different numbers, which is strictly worse
+        // than this error.
+        if let Task::Solve(spot) = &job.task {
+            if let Some(bref) = &spot.bunching {
+                let wrap = |reason: String| JobError::BunchingUnavailable { id, reason };
+                let data = {
+                    // The job's own retained Arc survives `release` and `forget` of the
+                    // preparation; the shared resolution path is only the fallback.
+                    let own = job.bunching_data.lock().unwrap().clone();
+                    match own {
+                        Some(data) => data,
+                        None => resolve_bunching(shared, bref, spot.max_memory_bytes)
+                            .map_err(|e| wrap(e.to_string()))?,
+                    }
+                };
+                engine::reapply_bunching(&mut game, &data).map_err(wrap)?;
+                *job.bunching_data.lock().unwrap() = Some(data);
+            }
+        }
+        *guard = Some(game);
+        // The status is updated while the game guard is still held: dropping it first
+        // would let `release_others` (from a concurrent `open`, or a solve starting) take
+        // the freshly loaded game in the gap, leaving `resident: true` with no game and
+        // turning this read into a bogus error. No deadlock: this game → status nesting is
+        // the one ordering the module uses, and no path acquires the game lock while
+        // holding a status lock.
+        job.status.lock().unwrap().resident = true;
+    }
+    Ok(guard)
 }
 
 /// Turn a solve's bunching reference into data, at the moment it is needed.
@@ -1846,6 +2318,7 @@ mod tests {
             game: Mutex::new(None),
             bunching_data: Mutex::new(Some(Arc::new(data))),
             best_response: Mutex::new([None, None]),
+            report_result: Mutex::new(None),
         });
         jobs.shared.jobs.lock().unwrap().insert(id, job);
 
@@ -1860,6 +2333,58 @@ mod tests {
             "62 MB of about-to-be-reused data is not what the sweep exists to reclaim"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_skips_a_tree_someone_is_holding_rather_than_waiting() {
+        // The try_lock behaviour that keeps `open`/`solve` responsive during a minutes-long
+        // dump: a held game lock is skipped, not waited for, and everything else still sweeps.
+        let dir = std::env::temp_dir().join(format!("pkwiz-jobs-trylock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let jobs = Jobs::new(Arc::new(crate::Silent));
+        let board: Vec<pkwiz_range::Card> = ["2c", "7d", "Th", "4s", "Qd"]
+            .iter()
+            .map(|c| pkwiz_range::Card::parse(c).unwrap())
+            .collect();
+
+        let mut ids = Vec::new();
+        for name in ["held.bin", "swept.bin"] {
+            let mut spot = Spot::from_hand(&board, 100, 100, "QQ+", "QQ+");
+            spot.stop.max_iterations = 10;
+            spot.save_path = Some(dir.join(name).to_string_lossy().into_owned());
+            ids.push(jobs.submit(spot).unwrap().job_id);
+        }
+        let (held, swept) = (ids[0], ids[1]);
+        for id in [held, swept] {
+            assert_eq!(finish(&jobs, id).phase, Phase::Done);
+        }
+        // The second solve's start swept the first; read it back in so both are resident.
+        assert!(jobs.node(held, &[]).is_ok());
+
+        // Hold `held`'s game lock the way a running analysis does. `std::sync::Mutex` is not
+        // reentrant, so the sweep's `try_lock` below contends exactly as it would cross-thread.
+        let held_job = jobs.job(held).unwrap();
+        let release_guard = held_job.game.lock().unwrap();
+
+        let started = Instant::now();
+        release_others(&jobs.shared, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the sweep waited on a held lock"
+        );
+
+        assert!(
+            jobs.status(held).unwrap().resident,
+            "a tree in active use is exactly the wrong one to release"
+        );
+        assert!(
+            !jobs.status(swept).unwrap().resident,
+            "the uncontended tree still goes back"
+        );
+
+        drop(release_guard);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

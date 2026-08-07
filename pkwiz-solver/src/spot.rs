@@ -266,8 +266,9 @@ impl Stop {
 }
 
 /// Serde's default for [`Spot::compression_level`] — a function because `#[serde(default)]` on an
-/// `Option` means `None`, and `None` here means "write it raw".
-fn default_compression_level() -> Option<i32> {
+/// `Option` means `None`, and `None` here means "write it raw". `pub(crate)` because
+/// `DumpSpec::compression_level` shares the same default by path.
+pub(crate) fn default_compression_level() -> Option<i32> {
     Spot::default_compression_level()
 }
 
