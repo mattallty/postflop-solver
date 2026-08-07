@@ -170,6 +170,10 @@ pub struct JobStatus {
     pub resident: bool,
     pub error: Option<String>,
     /// The convergence curve, decimated (see `engine::push_sample`).
+    ///
+    /// Populated live: every progress frame carries the curve so far, so a host can draw
+    /// convergence while the solve runs rather than only after it. The terminal frame carries
+    /// the authoritative final curve.
     pub history: Vec<Sample>,
     /// Preparation progress and result. `null` on solve jobs.
     pub bunching: Option<BunchingStatus>,
@@ -1127,6 +1131,16 @@ fn run_solve_job(shared: &Arc<Shared>, job: &Arc<Job>, spot: &Spot, started: Ins
                 let mut status = job.status.lock().unwrap();
                 status.iterations = iterations;
                 status.exploitability = Some(exploitability);
+                // The same decimation the engine loop applies to its own copy; the terminal
+                // frame overwrites with the authoritative curve, so any drift between the two
+                // decimation schedules ends with the job.
+                engine::push_sample(
+                    &mut status.history,
+                    Sample {
+                        iteration: iterations,
+                        exploitability,
+                    },
+                );
                 status.elapsed_ms = started.elapsed().as_millis() as u64;
                 // Throttled: a river tree measures exploitability many times a second and a
                 // frame per measurement would drown the pipe in noise nobody can read.

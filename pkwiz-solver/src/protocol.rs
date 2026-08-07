@@ -198,6 +198,13 @@ pub enum Command {
         #[serde(default)]
         max_memory_bytes: Option<u64>,
     },
+    /// Expand a range to its weighted combinations, server-side.
+    ///
+    /// Exists so the host and this solver can never disagree about what a notation means: the
+    /// expansion comes from the same parser every solve uses. Accepts everything a spot's
+    /// range fields accept (notation or an explicit list).
+    #[serde(rename = "range", rename_all = "camelCase")]
+    Range { range: crate::spot::RangeSpec },
     /// Liveness check.
     #[serde(rename = "ping")]
     Ping,
@@ -212,6 +219,24 @@ pub enum Command {
     /// cancelled solve is still finalized and saved.
     #[serde(rename = "shutdown")]
     Shutdown,
+}
+
+/// A range expanded to its weighted combinations, the `range` command's response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeResult {
+    /// Every combination with positive weight, rendered `"AsKh"` style (highest card first),
+    /// in the parser's own order.
+    pub combos: Vec<ComboWeight>,
+    pub count: usize,
+}
+
+/// One weighted combination of [`RangeResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComboWeight {
+    pub combo: String,
+    pub weight: f32,
 }
 
 /// Version information, for diagnosing a stale sidecar.
@@ -290,6 +315,23 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
             path,
             max_memory_bytes,
         } => json(&jobs.open_bunching(&path, max_memory_bytes)?)?,
+        Command::Range { range } => {
+            let resolved = range
+                .resolve()
+                .map_err(|e| JobError::Engine(crate::engine::EngineError::Spot(e)))?;
+            let combos: Vec<ComboWeight> = resolved
+                .combos()
+                .iter()
+                .map(|wc| ComboWeight {
+                    combo: wc.combo.to_string(),
+                    weight: wc.weight as f32,
+                })
+                .collect();
+            json(&RangeResult {
+                count: combos.len(),
+                combos,
+            })?
+        }
         Command::Ping => serde_json::json!({ "pong": true }),
         Command::Version | Command::Shutdown => json(&version())?,
     };

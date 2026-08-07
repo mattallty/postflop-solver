@@ -490,7 +490,7 @@ const MAX_SAMPLES: usize = 512;
 /// A 100k-iteration solve measured every ten iterations would otherwise accumulate ten thousand
 /// samples, all of which ride on every `progress` response. Decimating keeps the shape of the
 /// curve — which is all anyone plots it for — at a bounded cost.
-fn push_sample(history: &mut Vec<Sample>, sample: Sample) {
+pub(crate) fn push_sample(history: &mut Vec<Sample>, sample: Sample) {
     if history.len() >= MAX_SAMPLES {
         let mut keep = false;
         history.retain(|_| {

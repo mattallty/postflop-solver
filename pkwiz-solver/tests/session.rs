@@ -595,3 +595,32 @@ fn a_node_response_carries_ev_detail_and_lock_state_in_camel_case() {
     );
     assert_eq!(result["isLocked"], false);
 }
+
+#[test]
+fn the_range_command_expands_notation_with_the_one_parser() {
+    let (session, _) = session();
+
+    let v = call(&session, r#"{"id":1,"cmd":"range","range":"QQ+"}"#);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["result"]["count"], 18);
+    let combos = v["result"]["combos"].as_array().unwrap();
+    assert_eq!(combos.len(), 18);
+    assert!(combos
+        .iter()
+        .all(|c| c["combo"].as_str().unwrap().len() == 4 && c["weight"] == 1.0));
+
+    // Weights survive expansion.
+    let v = call(&session, r#"{"id":2,"cmd":"range","range":"AA:0.5"}"#);
+    assert_eq!(v["result"]["count"], 6);
+    assert!(v["result"]["combos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["weight"] == 0.5));
+
+    // A bad notation is the same form error a spot's range field produces.
+    let v = call(&session, r#"{"id":3,"cmd":"range","range":"XX"}"#);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "engine");
+    assert!(v["error"]["message"].as_str().unwrap().contains("XX"));
+}
