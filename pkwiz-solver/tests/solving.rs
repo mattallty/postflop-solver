@@ -1186,3 +1186,136 @@ fn progress_frames_carry_the_convergence_curve_live() {
         "the curve shrank mid-run: {lengths:?}"
     );
 }
+
+#[test]
+fn best_response_is_pure_and_dominates_the_current_strategy() {
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+,AKs,76s", 200));
+    let status_ev = done.ev.expect("a finished job has EVs");
+
+    for (player, &current_ev) in status_ev.iter().enumerate() {
+        let view = jobs.best_response(done.job_id, player, &[]).unwrap();
+        assert_eq!(view.player, player);
+        // The maximally exploitative strategy dominates the strategy it exploits, and the gap
+        // is this side's exploitability contribution.
+        assert!(
+            view.mes_ev >= current_ev - 1e-3,
+            "player {player}: mesEv {} < ev {current_ev}",
+            view.mes_ev,
+        );
+    }
+
+    // At the root OOP acts, so the OOP view carries the strategy-shaped arrays, dimensioned
+    // actions x hands like NodeView's.
+    let root = jobs.best_response(done.job_id, 0, &[]).unwrap();
+    assert_eq!(root.acting_player, Some(0));
+    assert!(!root.is_terminal && !root.is_chance);
+    let num_actions = root.actions.len();
+    let num_hands = root.hands.len();
+    assert!(num_actions >= 2 && num_hands > 0);
+    assert_eq!(root.br_strategy.len(), num_actions);
+    assert_eq!(root.ev_detail.len(), num_actions);
+    for row in root.br_strategy.iter().chain(root.ev_detail.iter()) {
+        assert_eq!(row.len(), num_hands);
+    }
+    assert_eq!(root.br_actions.len(), num_hands);
+    assert_eq!(root.ev.len(), num_hands);
+    assert_eq!(root.weights.len(), num_hands);
+
+    // No locks, so every hand's best response is a pure one-hot at its argmax.
+    for hand in 0..num_hands {
+        let action = root.br_actions[hand].expect("no locks, so every hand has an argmax");
+        for (a, row) in root.br_strategy.iter().enumerate() {
+            let expected = if a == action { 1.0 } else { 0.0 };
+            assert_eq!(row[hand], expected, "hand {hand}, action {a}");
+        }
+    }
+
+    // The IP view at the same OOP-acting node still answers IP's hands and EVs — the
+    // strategy-shaped arrays are just empty, because IP does not act here.
+    let ip = jobs.best_response(done.job_id, 1, &[]).unwrap();
+    assert_eq!(ip.acting_player, Some(0));
+    assert!(ip.br_strategy.is_empty() && ip.br_actions.is_empty() && ip.ev_detail.is_empty());
+    assert_eq!(ip.ev.len(), ip.hands.len());
+    assert!(ip.average_ev.is_some());
+}
+
+#[test]
+fn best_response_answers_at_chance_nodes_with_card_id_history() {
+    // A four-card board is a turn spot; with no turn sizing, check/check reaches the river
+    // deal.
+    let (jobs, done) = solve(river("2c7dTh4s", "QQ+", 40));
+
+    let chance = jobs.best_response(done.job_id, 0, &[0, 0]).unwrap();
+    assert!(chance.is_chance && !chance.is_terminal);
+    assert_eq!(chance.acting_player, None);
+    assert!(chance.br_strategy.is_empty() && chance.br_actions.is_empty());
+    assert!(chance.ev_detail.is_empty());
+    // ...but the best-response EVs exist here, which is the superset over NodeView.
+    assert_eq!(chance.ev.len(), chance.hands.len());
+    assert!(!chance.ev.is_empty());
+    assert!(chance.average_ev.is_some());
+    assert!(chance.actions.iter().all(|a| a.starts_with("Chance(")));
+
+    // Descending through the chance node uses the dealt card's id — 14 is 5h, live on this
+    // board — and lands on the river decision node.
+    let river_node = jobs.best_response(done.job_id, 0, &[0, 0, 14]).unwrap();
+    assert!(!river_node.is_chance && !river_node.is_terminal);
+    assert_eq!(river_node.acting_player, Some(0));
+    assert_eq!(river_node.br_strategy.len(), river_node.actions.len());
+}
+
+#[test]
+fn best_response_errors_carry_stable_codes() {
+    let (jobs, done) = solve(river("2c7dTh4sQd", "QQ+", 20));
+
+    // player out of range
+    let err = jobs.best_response(done.job_id, 2, &[]).unwrap_err();
+    assert_eq!(err.code(), "bad_player");
+    assert!(err.to_string().contains("got 2"), "{err}");
+
+    // a history that does not describe a node
+    let err = jobs.best_response(done.job_id, 0, &[99]).unwrap_err();
+    assert_eq!(err.code(), "bad_node");
+
+    // a job that has not finished
+    let running = jobs.submit(river("2c7dTh4sQd", "QQ+", 1_000_000)).unwrap();
+    let err = jobs.best_response(running.job_id, 0, &[]).unwrap_err();
+    assert_eq!(err.code(), "not_readable");
+    jobs.cancel(running.job_id).unwrap();
+    finish(&jobs, running.job_id, Duration::from_secs(30));
+
+    // a bunching preparation has no strategy to read, whatever its phase
+    let spec: pkwiz_solver::BunchingSpec =
+        serde_json::from_str(r#"{"foldRanges":["AA"],"flop":"2c7dTh"}"#).unwrap();
+    let prep = jobs.submit_bunching(spec).unwrap();
+    let err = jobs.best_response(prep.job_id, 0, &[]).unwrap_err();
+    assert_eq!(err.code(), "not_readable");
+    jobs.cancel(prep.job_id).unwrap();
+}
+
+#[test]
+fn a_released_job_answers_best_response_identically_after_reload() {
+    let dir = temp_dir("br-release");
+    let path = dir.join("a.bin");
+
+    let mut spot = river("2c7dTh4sQd", "QQ+,AKs,76s", 100);
+    spot.save_path = Some(path.to_string_lossy().into_owned());
+    let (jobs, done) = solve(spot);
+
+    let before = jobs.best_response(done.job_id, 1, &[]).unwrap();
+
+    jobs.release(done.job_id).unwrap();
+    assert!(!jobs.status(done.job_id).unwrap().resident);
+
+    // The read transparently reloads the tree and recomputes the best response bit-for-bit;
+    // the release dropped the cache with the tree, so a stale answer cannot survive it.
+    let after = jobs.best_response(done.job_id, 1, &[]).unwrap();
+    assert_eq!(before, after);
+    assert!(jobs.status(done.job_id).unwrap().resident);
+
+    // The second call on the same (job, player) serves the cache and answers the same.
+    let again = jobs.best_response(done.job_id, 1, &[]).unwrap();
+    assert_eq!(after, again);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

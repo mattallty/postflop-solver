@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::MemoryEstimate;
-use crate::jobs::{JobError, JobId, JobStatus, Jobs, NodeView};
+use crate::jobs::{BestResponseView, JobError, JobId, JobStatus, Jobs, NodeView};
 use crate::spot::{BunchingRef, BunchingSpec, Spot};
 
 /// Bumped when a change to the request or response shape is not backward compatible.
@@ -146,6 +146,24 @@ pub enum Command {
     Node {
         job_id: JobId,
         /// Action indices from the root; at a chance node the index is the dealt card's id.
+        #[serde(default)]
+        history: Vec<usize>,
+    },
+    /// Read one node of a finished job's best-response (maximally exploitative) strategy.
+    ///
+    /// A separate command rather than more fields on `node`, so `node` stays cheap and hosts
+    /// opt in explicitly: the first call per (job, player) runs a whole-tree pass
+    /// synchronously while holding the job's game lock — the same latency class as `node`'s
+    /// transparent reload, seconds on a big flop tree — and is cached afterwards until the
+    /// job's tree is released.
+    #[serde(rename = "bestResponse", rename_all = "camelCase")]
+    BestResponse {
+        job_id: JobId,
+        /// 0 = OOP, 1 = IP — the exploiter, whose best response is computed against the other
+        /// side's current (possibly locked) strategy.
+        player: usize,
+        /// Same convention as `node`: action indices from the root; at a chance node the
+        /// index is the dealt card's id.
         #[serde(default)]
         history: Vec<usize>,
     },
@@ -300,6 +318,14 @@ pub fn execute(jobs: &Jobs, command: Command) -> Result<serde_json::Value, OpErr
         }
         Command::Node { job_id, history } => {
             let view: NodeView = jobs.node(job_id, &history)?;
+            json(&view)?
+        }
+        Command::BestResponse {
+            job_id,
+            player,
+            history,
+        } => {
+            let view: BestResponseView = jobs.best_response(job_id, player, &history)?;
             json(&view)?
         }
         Command::Save { job_id, path } => json(&jobs.save(job_id, &path)?)?,

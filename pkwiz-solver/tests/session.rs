@@ -624,3 +624,120 @@ fn the_range_command_expands_notation_with_the_one_parser() {
     assert_eq!(v["error"]["code"], "engine");
     assert!(v["error"]["message"].as_str().unwrap().contains("XX"));
 }
+
+#[test]
+fn the_best_response_command_parses_with_and_without_history() {
+    let with: Command =
+        serde_json::from_str(r#"{"cmd":"bestResponse","jobId":3,"player":1,"history":[0,1]}"#)
+            .unwrap();
+    assert_eq!(
+        with,
+        Command::BestResponse {
+            job_id: 3,
+            player: 1,
+            history: vec![0, 1],
+        }
+    );
+
+    // `history` defaults to the root, like `node`'s.
+    let without: Command =
+        serde_json::from_str(r#"{"cmd":"bestResponse","jobId":3,"player":0}"#).unwrap();
+    assert_eq!(
+        without,
+        Command::BestResponse {
+            job_id: 3,
+            player: 0,
+            history: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn a_best_response_view_round_trips_through_serde() {
+    // The documented example frame, as a struct: a locked hand shows its pinned mix and a
+    // null argmax, which is exactly what the Option-typed field has to survive round-tripping.
+    let view = pkwiz_solver::BestResponseView {
+        player: 1,
+        history: vec![0, 1],
+        board: vec!["6h".into(), "9d".into(), "Td".into()],
+        is_terminal: false,
+        is_chance: false,
+        acting_player: Some(1),
+        actions: vec!["Fold".into(), "Call".into(), "Raise(300)".into()],
+        hands: vec!["QhQs".into(), "KhKs".into(), "AhAs".into()],
+        weights: vec![12.0, 12.0, 6.0],
+        br_strategy: vec![
+            vec![0.0, 0.0, 0.5],
+            vec![1.0, 0.0, 0.5],
+            vec![0.0, 1.0, 0.0],
+        ],
+        br_actions: vec![Some(1), Some(2), None],
+        ev: vec![112.4, 131.9, 96.2],
+        ev_detail: vec![
+            vec![0.0, 0.0, 0.0],
+            vec![112.4, 120.3, 96.2],
+            vec![95.1, 131.9, 88.0],
+        ],
+        is_locked: true,
+        average_ev: Some(115.0),
+        mes_ev: 4.85,
+    };
+
+    let json = serde_json::to_value(&view).unwrap();
+    // The wire names, pinned: camelCase throughout.
+    assert!(json.get("actingPlayer").is_some());
+    assert!(json.get("brStrategy").is_some());
+    assert!(json.get("brActions").is_some());
+    assert!(json.get("evDetail").is_some());
+    assert!(json.get("isLocked").is_some());
+    assert!(json.get("averageEv").is_some());
+    assert!(json.get("mesEv").is_some());
+    assert_eq!(json["brActions"][2], serde_json::Value::Null);
+
+    let back: pkwiz_solver::BestResponseView = serde_json::from_value(json).unwrap();
+    assert_eq!(view, back);
+}
+
+#[test]
+fn a_best_response_over_the_wire_speaks_camel_case_and_stable_codes() {
+    let (session, _) = session();
+    let queued = call(
+        &session,
+        &format!(r#"{{"id":1,"cmd":"solve","spot":{SPOT}}}"#),
+    );
+    let id = queued["result"]["jobId"].as_u64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let v = call(&session, &format!(r#"{{"cmd":"progress","jobId":{id}}}"#));
+        if v["result"]["phase"] == "done" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "job never finished: {v}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let response = call(
+        &session,
+        &format!(r#"{{"id":2,"cmd":"bestResponse","jobId":{id},"player":1}}"#),
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    let result = &response["result"];
+    assert_eq!(result["player"], 1);
+    // IP's best response read at the root, where OOP acts: hands and EVs are IP's, the
+    // strategy-shaped arrays are empty.
+    assert_eq!(result["actingPlayer"], 0);
+    assert_eq!(
+        result["ev"].as_array().unwrap().len(),
+        result["hands"].as_array().unwrap().len()
+    );
+    assert_eq!(result["brStrategy"].as_array().unwrap().len(), 0);
+    assert!(result["mesEv"].is_number());
+
+    let err = call(
+        &session,
+        &format!(r#"{{"id":3,"cmd":"bestResponse","jobId":{id},"player":2}}"#),
+    );
+    assert_eq!(err["ok"], false);
+    assert_eq!(err["error"]["code"], "bad_player");
+}

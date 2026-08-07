@@ -71,7 +71,8 @@ use serde::{Deserialize, Serialize};
 
 pub use engine::{EngineError, MemoryEstimate, Sample, Solved, Stopped, DEFAULT_MEMORY_LIMIT};
 pub use jobs::{
-    BunchingStatus, Emit, JobError, JobId, JobKind, JobStatus, Jobs, NodeView, Phase, Silent,
+    BestResponseView, BunchingStatus, Emit, JobError, JobId, JobKind, JobStatus, Jobs, NodeView,
+    Phase, Silent,
 };
 pub use protocol::{execute, Command, OpError, PROTOCOL_VERSION};
 pub use spot::{
@@ -92,9 +93,10 @@ pub struct Request {
 /// What went wrong, in a form the host can branch on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorBody {
-    /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`, `engine`,
-    /// `nothing_to_save`, `not_recoverable`, `not_finished`, `never_ran`, `not_bunching`,
-    /// `bunching_not_ready`, `bunching_unavailable`, `serialize`, or `panic`.
+    /// Stable discriminant: `bad_request`, `no_such_job`, `not_readable`, `bad_node`,
+    /// `bad_player`, `engine`, `nothing_to_save`, `not_recoverable`, `not_finished`,
+    /// `never_ran`, `not_bunching`, `bunching_not_ready`, `bunching_unavailable`, `serialize`,
+    /// or `panic`.
     pub code: String,
     pub message: String,
 }

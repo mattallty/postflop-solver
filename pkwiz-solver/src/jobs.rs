@@ -60,7 +60,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use postflop_solver::{Action, BunchingData, PostFlopGame};
+use postflop_solver::{Action, BestResponse, BunchingData, PostFlopGame};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{self, EngineError, MemoryEstimate, Sample, Solved, Stopped};
@@ -296,6 +296,11 @@ struct Job {
     /// position as `game` — before `status`, never after — so the module's deadlock-freedom
     /// argument covers it unchanged.
     bunching_data: Mutex<Option<Arc<BunchingData>>>,
+    /// Per-player best-response cache, computed lazily by the `bestResponse` command and
+    /// dropped whenever the tree is released (the cache is strategy-sized, exactly the class
+    /// of memory the release sweep exists to reclaim). Always `[None, None]` on a bunching
+    /// job. Its place in the lock order is game → bunching_data → best_response → status.
+    best_response: Mutex<[Option<Arc<BestResponse>>; 2]>,
 }
 
 struct Shared {
@@ -354,6 +359,8 @@ pub enum JobError {
     BunchingNotReady { id: JobId, phase: Phase },
     #[error("job {id} was solved with bunching data that could not be re-established: {reason}")]
     BunchingUnavailable { id: JobId, reason: String },
+    #[error("player must be 0 (OOP) or 1 (IP), got {0}")]
+    BadPlayer(usize),
 }
 
 impl JobError {
@@ -375,6 +382,7 @@ impl JobError {
             Self::NotBunching { .. } => "not_bunching",
             Self::BunchingNotReady { .. } => "bunching_not_ready",
             Self::BunchingUnavailable { .. } => "bunching_unavailable",
+            Self::BadPlayer(_) => "bad_player",
         }
     }
 }
@@ -470,6 +478,7 @@ impl Jobs {
             status: Mutex::new(status.clone()),
             game: Mutex::new(None),
             bunching_data: Mutex::new(None),
+            best_response: Mutex::new([None, None]),
         });
 
         self.shared.jobs.lock().unwrap().insert(id, job);
@@ -507,6 +516,7 @@ impl Jobs {
             status: Mutex::new(status.clone()),
             game: Mutex::new(None),
             bunching_data: Mutex::new(None),
+            best_response: Mutex::new([None, None]),
         });
 
         self.shared.jobs.lock().unwrap().insert(id, job);
@@ -566,6 +576,7 @@ impl Jobs {
             status: Mutex::new(status.clone()),
             game: Mutex::new(None),
             bunching_data: Mutex::new(Some(Arc::new(data))),
+            best_response: Mutex::new([None, None]),
         });
         self.shared.jobs.lock().unwrap().insert(id, job);
         self.shared.emit_status(&status);
@@ -816,6 +827,7 @@ impl Jobs {
             status: Mutex::new(status.clone()),
             game: Mutex::new(Some(game)),
             bunching_data: Mutex::new(data),
+            best_response: Mutex::new([None, None]),
         });
         self.shared.jobs.lock().unwrap().insert(id, job);
         self.shared.emit_status(&status);
@@ -838,6 +850,70 @@ impl Jobs {
     /// can no longer be read, or its bunching effect can no longer be re-established.
     pub fn node(&self, id: JobId, history: &[usize]) -> Result<NodeView, JobError> {
         let job = self.job(id)?;
+        let mut guard = self.ensure_resident_game(&job, id)?;
+        let game = guard
+            .as_mut()
+            .expect("ensure_resident_game only returns resident games");
+        node_view(game, history)
+    }
+
+    /// Read one node of a finished job's best-response (maximally exploitative) strategy.
+    ///
+    /// `player` is the exploiter: their best response is computed against the other side's
+    /// current — possibly locked — strategy, and every hand-indexed array in the view is
+    /// theirs, whichever player acts at the addressed node.
+    ///
+    /// The first call per (job, player) computes the best response synchronously with a
+    /// whole-tree pass while holding the job's game lock — the same latency class as `node`'s
+    /// transparent reload (milliseconds on a river tree, seconds on a big flop tree; progress
+    /// and cancel stay responsive, but concurrent reads of the same job wait). The result is
+    /// cached on the job and dropped when its tree is released, so later calls are as cheap as
+    /// `node`. A released job is reloaded first, exactly as `node` reloads it — bunching effect
+    /// included, *before* the best response is computed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Jobs::node`], plus `bad_player` if `player` is not 0 or 1.
+    pub fn best_response(
+        &self,
+        id: JobId,
+        player: usize,
+        history: &[usize],
+    ) -> Result<BestResponseView, JobError> {
+        if player > 1 {
+            return Err(JobError::BadPlayer(player));
+        }
+        let job = self.job(id)?;
+        let mut guard = self.ensure_resident_game(&job, id)?;
+        let game = guard
+            .as_mut()
+            .expect("ensure_resident_game only returns resident games");
+
+        // Consulted and populated under the game lock, so the cache can never outlive the game
+        // it was computed against (the release sweep also takes the game first). Detail is
+        // always kept: per-action EVs are the point of the command.
+        let br = {
+            let mut cache = job.best_response.lock().unwrap();
+            Arc::clone(
+                cache[player]
+                    .get_or_insert_with(|| Arc::new(game.compute_best_response(player, true))),
+            )
+        };
+
+        best_response_view(game, &br, history)
+    }
+
+    /// The shared front half of [`Jobs::node`] and [`Jobs::best_response`]: the readability
+    /// checks and the transparent reload of a released job. Factored so the two paths cannot
+    /// drift — a released *bunching* solve must have its effect re-applied before either reads
+    /// (or computes) anything, or it would silently answer non-bunching numbers.
+    ///
+    /// On success the returned guard is always `Some`.
+    fn ensure_resident_game<'a>(
+        &self,
+        job: &'a Arc<Job>,
+        id: JobId,
+    ) -> Result<std::sync::MutexGuard<'a, Option<PostFlopGame>>, JobError> {
         if matches!(job.task, Task::Bunching(_)) {
             return Err(JobError::NotBunchingReadable(id));
         }
@@ -892,8 +968,7 @@ impl Jobs {
             // holding a status lock.
             job.status.lock().unwrap().resident = true;
         }
-        let game = guard.as_mut().ok_or(JobError::NotReadable { id, phase })?;
-        node_view(game, history)
+        Ok(guard)
     }
 
     /// Stop the worker after the job it is on. Idempotent.
@@ -947,13 +1022,17 @@ impl Shared {
 
 /// Drop one job's product — its game, or a bunching job's data — and say so. Assumes the caller
 /// has established that it is recoverable. On a *solve* job that used bunching data, only the
-/// game goes: the retained `Arc` is what lets the reload re-apply the effect.
+/// game and the best-response cache go: the retained `Arc` is what lets the reload re-apply the
+/// effect, while the cache is strategy-sized — exactly the class of memory this sweep exists to
+/// reclaim — and is recomputed on demand.
 ///
-/// The game (or data) guard is released before the status lock is taken. Only `node`'s reload
-/// path nests them, in game → bunching_data → status order; nothing nests them the other way,
-/// which is what keeps the module deadlock-free.
+/// The game (or data) guard is released before the status lock is taken. The module's one lock
+/// order is game → bunching_data → best_response → status (`ensure_resident_game`'s reload
+/// nests game → bunching_data → status, and `best_response` nests game → best_response);
+/// nothing nests them the other way, which is what keeps the module deadlock-free.
 fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
     let dropped_game;
+    let mut dropped_br = [None, None];
     let mut dropped_data = None;
     match &job.task {
         Task::Solve(_) => {
@@ -962,6 +1041,7 @@ fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
                 // Already released. Nothing changed, so nothing is announced.
                 return;
             }
+            dropped_br = std::mem::take(&mut *job.best_response.lock().unwrap());
         }
         Task::Bunching(_) => {
             dropped_game = None;
@@ -974,6 +1054,7 @@ fn release_recoverable(shared: &Arc<Shared>, job: &Arc<Job>) {
     // Dropped outside both locks: freeing gigabytes is not instant and a `progress` query must not
     // queue behind it.
     drop(dropped_game);
+    drop(dropped_br);
     drop(dropped_data);
 
     let mut status = job.status.lock().unwrap();
@@ -1549,6 +1630,168 @@ fn node_view(game: &mut PostFlopGame, history: &[usize]) -> Result<NodeView, Job
     })
 }
 
+/// One node of a finished job's best response, the `bestResponse` command's answer.
+///
+/// The shape follows [`NodeView`], with one deliberate difference: every hand-indexed array is
+/// the *best-response player's* hands ([`Self::player`]), even at a node where the other player
+/// acts — the command answers "what does this side's exploiter hold and make here", not "who
+/// acts here".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BestResponseView {
+    /// The exploiter, echoed from the request. All hand-indexed arrays below are THIS player's
+    /// hands, even when `actingPlayer` is the other player.
+    pub player: usize,
+    /// The action indices that were replayed to get here ([`NodeView::history`] conventions —
+    /// at a chance node the index is the dealt card's id).
+    pub history: Vec<usize>,
+    /// The board at this node.
+    pub board: Vec<String>,
+    pub is_terminal: bool,
+    pub is_chance: bool,
+    /// Who acts at this node ([`NodeView::player`] semantics). Absent at terminal and chance
+    /// nodes.
+    pub acting_player: Option<usize>,
+    /// The actions available here, rendered as in [`NodeView::actions`].
+    pub actions: Vec<String>,
+    /// The best-response player's hands — the index order of `weights`/`ev`/`brActions` and
+    /// the columns of `brStrategy`/`evDetail`.
+    pub hands: Vec<String>,
+    /// Normalized weights of the best-response player's hands here (current-strategy reach —
+    /// the display convention [`NodeView::weights`] shares).
+    pub weights: Vec<f32>,
+    /// Action-major pure best-response strategy, `brStrategy[a][h]`; locked hands show their
+    /// pinned mix. Empty unless the node is the best-response player's decision node.
+    pub br_strategy: Vec<Vec<f32>>,
+    /// Per-hand argmax into `actions`; `null` for a locked hand (it kept its pinned mix).
+    /// Empty unless the node is the best-response player's decision node.
+    pub br_actions: Vec<Option<usize>>,
+    /// Per-hand best-response EV at this node, same units as [`NodeView::ev`]. Present at
+    /// every non-terminal node — opponent and chance nodes included (a superset of
+    /// [`NodeView`]).
+    pub ev: Vec<f32>,
+    /// Per-action best-response EVs, `evDetail[a][h]`, [`NodeView::ev_detail`] conventions
+    /// (`Fold` rows 0.0, zero-weight hands 0.0). Empty unless the node is the best-response
+    /// player's decision node.
+    pub ev_detail: Vec<Vec<f32>>,
+    /// Whether this node is locked ([`NodeView::is_locked`] semantics).
+    pub is_locked: bool,
+    /// Range-weighted average of `ev`; `null` where `ev` is empty.
+    pub average_ev: Option<f32>,
+    /// Whole-game best-response (MES) EV of `player`, independent of `history` —
+    /// bias-subtracted, directly comparable to `JobStatus.ev[player]`; `mesEv − ev[player]` is
+    /// this side's exploitability contribution (rake-aware on both sides, since
+    /// `JobStatus.ev` is `compute_current_ev`).
+    pub mes_ev: f32,
+}
+
+fn best_response_view(
+    game: &mut PostFlopGame,
+    br: &BestResponse,
+    history: &[usize],
+) -> Result<BestResponseView, JobError> {
+    // The same validated replay `node_view` uses.
+    engine::walk(game, history).map_err(|step| JobError::BadHistory {
+        index: step.index,
+        available: step.available,
+    })?;
+
+    let player = br.player();
+    let mes_ev = br.total_ev();
+
+    let is_terminal = game.is_terminal_node();
+    let is_chance = game.is_chance_node();
+    let board = game
+        .current_board()
+        .iter()
+        .filter_map(|c| crate::convert::from_engine_card(*c).ok())
+        .map(|c| c.to_string())
+        .collect();
+
+    let actions: Vec<String> = if is_chance {
+        let mask = game.possible_cards();
+        (0..52u8)
+            .filter(|c| mask & (1u64 << c) != 0)
+            .filter_map(|c| crate::convert::from_engine_card(c).ok())
+            .map(|c| format!("Chance({c})"))
+            .collect()
+    } else {
+        game.available_actions().iter().map(render_action).collect()
+    };
+
+    if is_terminal {
+        return Ok(BestResponseView {
+            player,
+            history: history.to_vec(),
+            board,
+            is_terminal,
+            is_chance,
+            acting_player: None,
+            actions,
+            hands: Vec::new(),
+            weights: Vec::new(),
+            br_strategy: Vec::new(),
+            br_actions: Vec::new(),
+            ev: Vec::new(),
+            ev_detail: Vec::new(),
+            is_locked: false,
+            average_ev: None,
+            mes_ev,
+        });
+    }
+
+    game.cache_normalized_weights();
+
+    let hands = game
+        .private_cards(player)
+        .iter()
+        .map(|h| crate::convert::hole_to_string(*h).unwrap_or_else(|_| "??".to_owned()))
+        .collect::<Vec<_>>();
+    let num_hands = hands.len();
+
+    let weights = game.normalized_weights(player).to_vec();
+    let ev = game.br_expected_values(br);
+
+    let acting_player = (!is_chance).then(|| game.current_player());
+    let is_locked = !is_chance && game.current_locking_strategy().is_some();
+
+    // The strategy-shaped arrays exist only at the best-response player's own decision node;
+    // chunked exactly like `node_view` chunks `strategy`/`evDetail`.
+    let (br_strategy, br_actions, ev_detail) = if acting_player == Some(player) {
+        let chunk = |flat: Vec<f32>| -> Vec<Vec<f32>> {
+            flat.chunks(num_hands.max(1)).map(<[f32]>::to_vec).collect()
+        };
+        (
+            chunk(game.br_strategy(br)),
+            game.br_actions(br),
+            chunk(game.br_expected_values_detail(br)),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    let average_ev = Some(postflop_solver::compute_average(&ev, &weights));
+
+    Ok(BestResponseView {
+        player,
+        history: history.to_vec(),
+        board,
+        is_terminal,
+        is_chance,
+        acting_player,
+        actions,
+        hands,
+        weights,
+        br_strategy,
+        br_actions,
+        ev,
+        ev_detail,
+        is_locked,
+        average_ev,
+        mes_ev,
+    })
+}
+
 fn render_action(action: &Action) -> String {
     crate::convert::action_to_string(action)
 }
@@ -1602,6 +1845,7 @@ mod tests {
             status: Mutex::new(status),
             game: Mutex::new(None),
             bunching_data: Mutex::new(Some(Arc::new(data))),
+            best_response: Mutex::new([None, None]),
         });
         jobs.shared.jobs.lock().unwrap().insert(id, job);
 
