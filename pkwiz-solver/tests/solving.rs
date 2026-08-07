@@ -1151,3 +1151,38 @@ fn edited_trees_round_trip_through_a_file() {
 
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn progress_frames_carry_the_convergence_curve_live() {
+    let collector = Arc::new(Collector::default());
+    let jobs = Jobs::with_throttle(Arc::clone(&collector) as Arc<dyn Emit>, Duration::ZERO);
+    let id = jobs
+        .submit(river("2c7dTh4sQd", "QQ+,AKs,76s", 200))
+        .unwrap()
+        .job_id;
+    finish(&jobs, id, Duration::from_secs(60));
+
+    // Running frames must carry the curve so far — that is what lets a host draw convergence
+    // while the solve runs — and the curve must only ever grow between frames.
+    let mut lengths = Vec::new();
+    let mut running_with_history = 0;
+    for event in collector.events() {
+        let job = &event["job"];
+        if job["jobId"].as_u64() != Some(id) {
+            continue;
+        }
+        let len = job["history"].as_array().map_or(0, Vec::len);
+        lengths.push(len);
+        if job["phase"] == "running" && len > 1 {
+            running_with_history += 1;
+        }
+    }
+    assert!(
+        running_with_history > 0,
+        "no running frame carried a curve: {lengths:?}"
+    );
+    assert!(
+        lengths.windows(2).all(|w| w[1] >= w[0] || w[1] == 0),
+        "the curve shrank mid-run: {lengths:?}"
+    );
+}
