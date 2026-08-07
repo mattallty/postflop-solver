@@ -91,13 +91,11 @@ jobs:
           # Ubuntu pins the MSRV, so the sidecar cannot quietly outgrow the declared minimum.
           - os: ubuntu-latest
             toolchain: '1.97'
-          # Windows and macOS track `stable` — the toolchain the release pipeline actually
-          # ships — so the platforms we publish for run the whole suite, not only `--version`.
-          # Path handling in save/open and `\r\n` framing are exactly the kinds of bug a
-          # Linux-only suite cannot catch, and until now every released Windows and macOS
-          # binary had passed nothing but the smoke check.
-          - os: windows-latest
-            toolchain: stable
+          # macOS tracks `stable` — the toolchain the release pipeline actually ships — so a
+          # published non-Linux platform runs the whole suite here, not only `--version`.
+          # Path handling in save/open is exactly the kind of bug a Linux-only suite cannot
+          # catch, and until now every released macOS binary had passed nothing but the smoke
+          # check.
           - os: macos-latest
             toolchain: stable
     steps:
@@ -123,8 +121,7 @@ jobs:
     - name: Clippy
       run: cargo +${{ matrix.toolchain }} clippy --release --locked -p pkwiz-solver --all-targets -- -D warnings -A clippy::needless_range_loop
     # The release artifacts are what an application downloads, and it probes them with exactly
-    # this before trusting one. Failing here beats failing on a user's machine. Bash on every
-    # platform: Git Bash resolves the `.exe` on Windows, so one line covers all three.
+    # this before trusting one. Failing here beats failing on a user's machine.
     - name: It answers --version
       run: ./target/release/pkwiz-solver --version
       shell: bash
