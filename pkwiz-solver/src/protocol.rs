@@ -52,7 +52,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// its own, and bumping the engine revision for a protocol change would be a lie in the other
 /// direction — a host that keys "can I open this file?" on an exact match would mark a whole
 /// library of saved solves unreadable for a change that never touched the engine.
-pub const ENGINE_REV: &str = "f664271d0f38dcf24bd6e83d900d15b1e979bff6";
+pub const ENGINE_REV: &str = "a0b680fdd4c9b9066269cb492f477229bcc0b4d4";
 
 /// The version string the engine stamps into every solution it writes.
 ///
@@ -76,9 +76,12 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// the format. Every earlier revision stays on it, so a tree saved before any of those bumps is
 /// still offered rather than greyed out:
 ///
+/// - `f664271` — [PR #24](https://github.com/mattallty/postflop-solver/pull/24): best-response
+///   extraction. The current head sits on top of it with the ICM runtime effect — nothing the
+///   file format passes through, though see the verification note below for the one honest
+///   exception this pin move carries.
 /// - `35c5029` — [PR #19](https://github.com/mattallty/postflop-solver/pull/19): the polish
-///   pass. The current head sits on top of it with `compute_best_response` and its accessors —
-///   a new read-only module; nothing serialized changed.
+///   pass.
 /// - `d1f740d` — [PR #18](https://github.com/mattallty/postflop-solver/pull/18): parser and
 ///   numeric hardening.
 /// - `0741647` — [PR #17](https://github.com/mattallty/postflop-solver/pull/17): decode-time
@@ -100,9 +103,14 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 ///
 /// Verified 2026-08-02, for the oldest four: the same spot saved by every pair of builds is
 /// byte-identical, and each opens the others' files with identical node output. Each later
-/// pin move was verified the same way against the head built on top of it (most recently
-/// `35c5029`, 2026-08-07): the same solved turn spot, saved twice by each build, produced one
-/// identical file all four times.
+/// pin move was verified the same way against the head built on top of it — most recently
+/// `f664271` (2026-08-07), where for the first time the files were NOT byte-identical: they
+/// differ in exactly two bytes, both of them the self-reported memory-usage accounting (the
+/// header estimate and `misc_memory_usage`), because the ICM state enlarged the game struct
+/// and the accounting honestly says so. Every config, strategy, and node byte is identical,
+/// and the cross-open check — the new build reading both files — produced identical strategy
+/// checksums and EVs to ten decimal places. The entry is earned on the claim that matters
+/// (files interchange losslessly), with the two metadata bytes on the record.
 ///
 /// Since `prepareBunching`, each entry also asserts **bunching-file** layout compatibility,
 /// verified the same way: the same prepared data saved by both builds, byte-identical files.
@@ -114,6 +122,7 @@ pub const ENGINE_FORMAT: &str = "2023-03-19";
 /// clean version mismatch.
 pub const ENGINE_COMPATIBLE_REVS: &[&str] = &[
     ENGINE_REV,
+    "f664271d0f38dcf24bd6e83d900d15b1e979bff6",
     "35c5029bcaf2bdb7f7fa6b2c8761e83f0b06cf8b",
     "d1f740dfef713f1883b4b601b26c513502b98966",
     "0741647f1614ad8a091e4ff6638d54afea9044d2",
