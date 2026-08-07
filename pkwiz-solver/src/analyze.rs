@@ -1,9 +1,10 @@
-//! Aggregation reports and the full-tree dump — the traversal core both share.
+//! Aggregation reports, the full-tree dump, and the strategy simplification — the traversal
+//! core all three share.
 //!
-//! Both features are worker jobs ([`crate::jobs::JobKind::Report`] / `Dump`) over a *finished*
-//! solve's game, built entirely on the engine's public interpreter API: `apply_history`, `play`,
-//! `possible_cards`, `strategy`, and the cached-weight readers. The engine, its revision pin and
-//! its file format are untouched.
+//! All three are worker jobs ([`crate::jobs::JobKind::Report`] / `Dump` / `Simplify`) over a
+//! *finished* solve's game, built entirely on the engine's public interpreter API:
+//! `apply_history`, `play`, `possible_cards`, `strategy`, and the cached-weight readers. The
+//! engine, its revision pin and its file format are untouched.
 //!
 //! # Reports never traverse the full tree
 //!
@@ -120,6 +121,96 @@ pub struct DumpSpec {
 
 fn default_max_board_cards() -> u8 {
     5
+}
+
+/// What a `simplify` job computes: a grid-rounded, optionally purified copy of one player's
+/// strategy over a bounded region, expressed as a `locks` array in `Spot::locks`' exact shape.
+///
+/// Feed the locks to `resolve` to measure what the simplification costs — the resolved job's
+/// `ev`/`exploitability` are the honest numbers (`ev[player]` minus the source's `ev[player]`
+/// is the EV loss against an opponent free to exploit the pinned strategy; drive the resolve's
+/// `stop` tight, e.g. `targetExploitabilityPct: 0.1`, or the measurement is only as honest as
+/// its convergence). This job's own deviation stats are a free proxy, nothing more: a locked
+/// hand's zero-frequency actions are genuinely never taken, so the simplified strategy is
+/// exploitable *by design*, and its output must not be read as "still near-equilibrium"
+/// without the resolve's numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimplifySpec {
+    /// Source solve job (a `solve`, `open`, or `resolve`-created job).
+    pub job_id: JobId,
+    /// Whose strategy to simplify: 0 = OOP, 1 = IP. Only this player's decision nodes are
+    /// locked — the cost measurement needs the other side free to exploit, and a human follows
+    /// one seat's strategy.
+    pub player: usize,
+    /// Subtree root, node-command convention (chance step = dealt card id). Empty = the whole
+    /// tree, street-bounded below.
+    #[serde(default)]
+    pub history: Vec<usize>,
+    /// Do not descend a chance node once the board holds this many cards. Default 3, not
+    /// dump's 5: the locks output scales with every visited decision node, and "make this
+    /// street's strategy followable" is the primary use.
+    #[serde(default = "default_simplify_board_cards")]
+    pub max_board_cards: u8,
+    /// Frequencies become multiples of `1/grid`. 2 = halves, 4 = quarters; 1 = pure only (the
+    /// degenerate grid is full purification, deliberately).
+    #[serde(default = "default_grid")]
+    pub grid: u32,
+    /// A hand whose top action's frequency is at least this becomes pure — judged against the
+    /// *original* probabilities, before grid rounding moves them. `null` disables
+    /// purification.
+    #[serde(default = "default_purify")]
+    pub purify_threshold: Option<f32>,
+    /// Emit the `hands` guard on every lock. Doubles the size, and the same server against
+    /// the same spot cannot misalign, so default off.
+    #[serde(default)]
+    pub include_hands: bool,
+}
+
+fn default_simplify_board_cards() -> u8 {
+    3
+}
+
+fn default_grid() -> u32 {
+    2
+}
+
+fn default_purify() -> Option<f32> {
+    Some(0.8)
+}
+
+/// A finished simplification, in the exact shape `reportResult` serves for a simplify job.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimplifyResult {
+    pub format_version: u32,
+    pub source_job_id: JobId,
+    pub player: usize,
+    pub history: Vec<usize>,
+    pub grid: u32,
+    pub purify_threshold: Option<f32>,
+    pub max_board_cards: u8,
+    /// One entry per locked decision node, `Spot::locks` shape — feed to `resolve` verbatim.
+    /// An already-locked source node is rounded like any other (its `strategy()` shows the
+    /// pinned mix); a host wanting the source's locks verbatim splices them back in by
+    /// history. A node whose every hand is zero-weight emits no entry at all — an all-zero
+    /// lock would set `is_locked` while pinning nothing.
+    pub locks: Vec<crate::spot::Lock>,
+    pub nodes_visited: u64,
+    pub nodes_locked: u64,
+    /// Hands whose column was pinned (any positive entry).
+    pub hands_locked: u64,
+    /// Hands the purify threshold made pure, before rounding.
+    pub hands_purified: u64,
+    /// Zero-weight hands, emitted as all-zero columns — the engine's "free hand" encoding;
+    /// pinning a zero-reach hand would freeze solver noise.
+    pub hands_free: u64,
+    /// `max |simplified − original|` over locked entries.
+    pub max_deviation: f32,
+    /// Reach-weighted mean of per-hand L1 strategy distance, over locked hands.
+    pub mean_deviation: f32,
+    /// A street bound or storage boundary stopped descent somewhere.
+    pub truncated: bool,
 }
 
 /// Why an analysis could not run to completion. The worker maps [`Self::Cancelled`] to a
@@ -1040,26 +1131,7 @@ fn dump_node(game: &mut PostFlopGame, ctx: &mut DumpCtx<'_>) -> Result<(), Analy
             return Ok(());
         }
 
-        // The isomorphism dedupe, public-API only: the storage representatives are the
-        // `Action::Chance` children. If every one of them is itself dealable, storage and
-        // actual coordinates agree here, and playing exactly those cards reproduces the
-        // engine's representative-only traversal. If any is not dealable, a suit swap is
-        // active above us — fall back to every dealable card: correct, merely undeduplicated.
-        let representatives: Vec<u8> = game
-            .available_actions()
-            .iter()
-            .filter_map(|a| match a {
-                postflop_solver::Action::Chance(c) => Some(*c),
-                _ => None,
-            })
-            .collect();
-        let all_dealable = representatives.iter().all(|&c| mask & (1u64 << c) != 0);
-        let mut children = if all_dealable {
-            representatives
-        } else {
-            dealable
-        };
-        children.sort_unstable();
+        let children = chance_children(game);
 
         for (index, &card) in children.iter().enumerate() {
             if index > 0 {
@@ -1117,4 +1189,381 @@ fn dump_node(game: &mut PostFlopGame, ctx: &mut DumpCtx<'_>) -> Result<(), Analy
         dump_node(game, ctx)?;
     }
     Ok(())
+}
+
+/// The chance node's children to descend, ascending card id.
+///
+/// The isomorphism dedupe, public-API only: the storage representatives are the
+/// `Action::Chance` children. If every one of them is itself dealable, storage and actual
+/// coordinates agree here, and playing exactly those cards reproduces the engine's
+/// representative-only traversal. If any is not dealable, a suit swap is active above us —
+/// fall back to every dealable card: correct, merely undeduplicated. Shared by the dump and
+/// the simplification; for the latter the dedupe also keeps the locks array free of
+/// last-write-wins duplicates, since isomorphic branches share one storage node.
+fn chance_children(game: &PostFlopGame) -> Vec<u8> {
+    let mask = game.possible_cards();
+    let representatives: Vec<u8> = game
+        .available_actions()
+        .iter()
+        .filter_map(|a| match a {
+            postflop_solver::Action::Chance(c) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let all_dealable = representatives.iter().all(|&c| mask & (1u64 << c) != 0);
+    let mut children = if all_dealable {
+        representatives
+    } else {
+        (0..52u8).filter(|&c| mask & (1u64 << c) != 0).collect()
+    };
+    children.sort_unstable();
+    children
+}
+
+// ---------------------------------------------------------------------------------------------
+// The simplification.
+// ---------------------------------------------------------------------------------------------
+
+/// Walk the subtree under the spec's base and round the requested player's strategy onto the
+/// `1/grid` grid, emitting one `Lock` per locked decision node. `progress` receives the
+/// running node count.
+///
+/// The traversal is [`run_dump`]'s, minus the writer: `apply_history` sibling restore,
+/// `chance_children` isomorphism dedupe, the street bound and `may_descend` storage guard
+/// both setting `truncated`. A base that is a terminal or chance node, or a region where only
+/// the opponent acts, is legal and yields an empty locks array — a well-formed question with
+/// an empty answer.
+///
+/// # Errors
+///
+/// [`AnalyzeError`] — a base history that does not describe a node, or cancellation.
+pub fn run_simplify(
+    game: &mut PostFlopGame,
+    spec: &SimplifySpec,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<SimplifyResult, AnalyzeError> {
+    engine::walk(game, &spec.history)?;
+
+    let mut ctx = SimplifyCtx {
+        spec,
+        cancel,
+        progress,
+        locks: Vec::new(),
+        nodes_visited: 0,
+        nodes_locked: 0,
+        hands_locked: 0,
+        hands_purified: 0,
+        hands_free: 0,
+        max_deviation: 0.0,
+        l1_weighted: 0.0,
+        weight_sum: 0.0,
+        truncated: false,
+    };
+    simplify_node(game, &mut ctx)?;
+
+    // 0-guarded like every other range average here: a region with no locked hands has no
+    // meaningful mean.
+    let mean_deviation = if ctx.weight_sum > 0.0 {
+        (ctx.l1_weighted / ctx.weight_sum) as f32
+    } else {
+        0.0
+    };
+
+    Ok(SimplifyResult {
+        format_version: FORMAT_VERSION,
+        source_job_id: spec.job_id,
+        player: spec.player,
+        history: spec.history.clone(),
+        grid: spec.grid,
+        purify_threshold: spec.purify_threshold,
+        max_board_cards: spec.max_board_cards,
+        locks: ctx.locks,
+        nodes_visited: ctx.nodes_visited,
+        nodes_locked: ctx.nodes_locked,
+        hands_locked: ctx.hands_locked,
+        hands_purified: ctx.hands_purified,
+        hands_free: ctx.hands_free,
+        max_deviation: ctx.max_deviation,
+        mean_deviation,
+        truncated: ctx.truncated,
+    })
+}
+
+struct SimplifyCtx<'a> {
+    spec: &'a SimplifySpec,
+    cancel: &'a AtomicBool,
+    progress: &'a mut dyn FnMut(u64),
+    locks: Vec<crate::spot::Lock>,
+    nodes_visited: u64,
+    nodes_locked: u64,
+    hands_locked: u64,
+    hands_purified: u64,
+    hands_free: u64,
+    max_deviation: f32,
+    /// `Σ w·L1` over locked hands, and the matching `Σ w` — the reach-weighted mean's parts.
+    l1_weighted: f64,
+    weight_sum: f64,
+    truncated: bool,
+}
+
+/// The recursive traversal, [`dump_node`]'s twin (see its comment on recursion depth and
+/// sibling restore).
+fn simplify_node(game: &mut PostFlopGame, ctx: &mut SimplifyCtx<'_>) -> Result<(), AnalyzeError> {
+    if ctx.cancel.load(Ordering::Relaxed) {
+        return Err(AnalyzeError::Cancelled);
+    }
+
+    ctx.nodes_visited += 1;
+    (ctx.progress)(ctx.nodes_visited);
+    if game.is_terminal_node() {
+        return Ok(());
+    }
+
+    let history = game.history().to_vec();
+
+    if game.is_chance_node() {
+        // Street bound and storage boundary both refuse descent, and the result says so.
+        if game.current_board().len() >= usize::from(ctx.spec.max_board_cards) || !may_descend(game)
+        {
+            ctx.truncated = true;
+            return Ok(());
+        }
+        for (index, &card) in chance_children(game).iter().enumerate() {
+            if index > 0 {
+                game.apply_history(&history);
+            }
+            game.play(usize::from(card));
+            simplify_node(game, ctx)?;
+        }
+        return Ok(());
+    }
+
+    let player = game.current_player();
+    if player == ctx.spec.player {
+        simplify_decision_node(game, ctx, &history);
+    }
+
+    // Descend through both players' nodes: the requested player's next decision may sit below
+    // an opponent action.
+    let num_actions = game.available_actions().len();
+    for index in 0..num_actions {
+        if index > 0 {
+            game.apply_history(&history);
+        }
+        game.play(index);
+        simplify_node(game, ctx)?;
+    }
+    Ok(())
+}
+
+/// Round one decision node of the requested player, pushing a `Lock` unless every hand came
+/// out free.
+fn simplify_decision_node(game: &mut PostFlopGame, ctx: &mut SimplifyCtx<'_>, history: &[usize]) {
+    let player = game.current_player();
+    // The zero-weight skip needs per-node normalized weights — the O(#OOP × #IP) cost on a
+    // bunching source that makes simplify a job rather than a synchronous command.
+    game.cache_normalized_weights();
+    let weights = game.normalized_weights(player).to_vec();
+    let num_hands = weights.len();
+    let num_actions = game.available_actions().len();
+    let flat = game.strategy();
+
+    let mut rows = vec![vec![0.0f32; num_hands]; num_actions];
+    let mut any_locked = false;
+    for h in 0..num_hands {
+        if weights[h] == 0.0 {
+            // All-zero column: the engine's "free hand" encoding.
+            ctx.hands_free += 1;
+            continue;
+        }
+        let column: Vec<f32> = (0..num_actions).map(|a| flat[a * num_hands + h]).collect();
+        let (rounded, purified) = round_column(&column, ctx.spec.grid, ctx.spec.purify_threshold);
+        if purified {
+            ctx.hands_purified += 1;
+        }
+        ctx.hands_locked += 1;
+        any_locked = true;
+
+        let mut l1 = 0.0f64;
+        for a in 0..num_actions {
+            let deviation = (rounded[a] - column[a]).abs();
+            ctx.max_deviation = ctx.max_deviation.max(deviation);
+            l1 += f64::from(deviation);
+            rows[a][h] = rounded[a];
+        }
+        ctx.l1_weighted += f64::from(weights[h]) * l1;
+        ctx.weight_sum += f64::from(weights[h]);
+    }
+
+    if any_locked {
+        ctx.nodes_locked += 1;
+        let hands = ctx.spec.include_hands.then(|| {
+            game.private_cards(player)
+                .iter()
+                .map(|&h| crate::convert::hole_to_string(h).unwrap_or_else(|_| "??".to_owned()))
+                .collect()
+        });
+        ctx.locks.push(crate::spot::Lock {
+            history: history.to_vec(),
+            strategy: rows,
+            hands,
+        });
+    }
+}
+
+/// Round one hand's action distribution onto the `1/grid` grid. Returns the rounded column and
+/// whether purification fired.
+///
+/// Purify runs **before** grid rounding — the threshold judges the original probabilities, not
+/// numbers the rounding already moved — with ties going to the lowest action index (the
+/// engine's best-response convention). The grid step is largest-remainder renormalization in
+/// integer units: `u[a] = round(p[a]·grid)`, then `Σu` is repaired to exactly `grid` by
+/// incrementing the largest positive remainders (deficit) or decrementing positive entries
+/// with the smallest remainders (surplus), ties to the lowest index for determinism. The
+/// result always has a positive entry (`Σu = grid ≥ 1`), so a locked column can never
+/// degenerate into the free-hand encoding, and the ratios are exactly on-grid — the engine's
+/// per-hand normalization divides by ≈1 and is a no-op in ratio terms.
+fn round_column(p: &[f32], grid: u32, purify_threshold: Option<f32>) -> (Vec<f32>, bool) {
+    let mut best = 0;
+    for (a, &v) in p.iter().enumerate() {
+        // Strict comparison: ties keep the lowest index.
+        if v > p[best] {
+            best = a;
+        }
+    }
+    if let Some(threshold) = purify_threshold {
+        if p[best] >= threshold {
+            let mut column = vec![0.0; p.len()];
+            column[best] = 1.0;
+            return (column, true);
+        }
+    }
+
+    let grid_f = f64::from(grid);
+    let exact: Vec<f64> = p.iter().map(|&v| f64::from(v) * grid_f).collect();
+    let mut units: Vec<i64> = exact.iter().map(|&e| e.round() as i64).collect();
+    let mut sum: i64 = units.iter().sum();
+    let target = i64::from(grid);
+    while sum < target {
+        let mut pick = 0;
+        let mut best_remainder = f64::NEG_INFINITY;
+        for (a, &e) in exact.iter().enumerate() {
+            let remainder = e - units[a] as f64;
+            if remainder > best_remainder {
+                best_remainder = remainder;
+                pick = a;
+            }
+        }
+        units[pick] += 1;
+        sum += 1;
+    }
+    while sum > target {
+        let mut pick = None;
+        let mut best_remainder = f64::INFINITY;
+        for (a, &e) in exact.iter().enumerate() {
+            if units[a] == 0 {
+                continue;
+            }
+            let remainder = e - units[a] as f64;
+            if remainder < best_remainder {
+                best_remainder = remainder;
+                pick = Some(a);
+            }
+        }
+        let pick = pick.expect("a positive sum implies a positive entry");
+        units[pick] -= 1;
+        sum -= 1;
+    }
+
+    (
+        units.iter().map(|&u| (u as f64 / grid_f) as f32).collect(),
+        false,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounding_lands_on_the_grid_and_repairs_the_sum() {
+        // Plain rounding that already sums right.
+        let (rounded, purified) = round_column(&[0.6, 0.4], 2, None);
+        assert_eq!(rounded, vec![0.5, 0.5]);
+        assert!(!purified);
+
+        // Quarters.
+        let (rounded, _) = round_column(&[0.7, 0.2, 0.1], 4, None);
+        assert_eq!(rounded, vec![0.75, 0.25, 0.0]);
+
+        // Deficit repair: five near-uniform actions at grid 2 — every unit rounds to zero and
+        // the two missing units go to the largest remainders, ties broken by lowest index.
+        let (rounded, _) = round_column(&[0.2, 0.2, 0.2, 0.2, 0.2], 2, None);
+        assert_eq!(rounded, vec![0.5, 0.5, 0.0, 0.0, 0.0]);
+
+        // Surplus repair: both 0.5s round up at grid 1 and the lowest index is decremented.
+        let (rounded, _) = round_column(&[0.5, 0.5], 1, None);
+        assert_eq!(rounded, vec![0.0, 1.0]);
+
+        // Determinism: the same column rounds the same way every time.
+        for _ in 0..3 {
+            let (again, _) = round_column(&[0.2, 0.2, 0.2, 0.2, 0.2], 2, None);
+            assert_eq!(again, vec![0.5, 0.5, 0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn grid_one_is_full_purification() {
+        let (rounded, purified) = round_column(&[0.6, 0.3, 0.1], 1, None);
+        assert_eq!(rounded, vec![1.0, 0.0, 0.0]);
+        assert!(!purified, "the grid did it, not the threshold");
+    }
+
+    #[test]
+    fn purify_judges_the_original_probabilities_before_rounding() {
+        // 0.85 meets the 0.8 threshold: pure, and flagged as purified.
+        let (rounded, purified) = round_column(&[0.85, 0.15], 2, Some(0.8));
+        assert_eq!(rounded, vec![1.0, 0.0]);
+        assert!(purified);
+
+        // 0.6 does not meet 0.9 — but at grid 2 it rounds to a half-half mix, which a
+        // threshold applied *after* rounding would have judged differently.
+        let (rounded, purified) = round_column(&[0.6, 0.4], 2, Some(0.9));
+        assert_eq!(rounded, vec![0.5, 0.5]);
+        assert!(!purified);
+
+        // Tie on the max: the lowest action index wins, the engine's own convention.
+        let (rounded, purified) = round_column(&[0.5, 0.5], 2, Some(0.5));
+        assert_eq!(rounded, vec![1.0, 0.0]);
+        assert!(purified);
+    }
+
+    #[test]
+    fn every_rounded_column_sums_to_one_on_the_grid() {
+        // Awkward inputs: float noise, a dominant tail entry, a grid that is not a power of
+        // two. The invariant is Σ = 1 (within float addition) and every entry a multiple of
+        // 1/grid in integer units.
+        for (p, grid) in [
+            (vec![0.333_333_34f32, 0.333_333_34, 0.333_333_34], 3u32),
+            (vec![0.05, 0.05, 0.9], 2),
+            (vec![0.998, 0.001, 0.001], 64),
+            (vec![0.25; 4], 2),
+        ] {
+            let (rounded, _) = round_column(&p, grid, None);
+            let sum: f64 = rounded.iter().map(|&v| f64::from(v)).sum();
+            assert!((sum - 1.0).abs() < 1e-6, "{p:?} at grid {grid}: sum {sum}");
+            assert!(
+                rounded.iter().any(|&v| v > 0.0),
+                "{p:?} at grid {grid}: a locked column must pin something"
+            );
+            for &v in &rounded {
+                let units = f64::from(v) * f64::from(grid);
+                assert!(
+                    (units - units.round()).abs() < 1e-6,
+                    "{p:?} at grid {grid}: {v} is off-grid"
+                );
+            }
+        }
+    }
 }
